@@ -34,7 +34,7 @@ import typer
 from loguru import logger
 
 # Version and author information
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 AUTHOR = "@zudsniper"
 GITHUB = "https://github.com/zudsniper/wazepolice"
 
@@ -160,7 +160,8 @@ class WazeAPIDataScraper:
         alert_types: List[str] = DEFAULT_ALERT_TYPES,
         full_mode: bool = False,
         collate: bool = False,
-        max_retries: int = 5
+        max_retries: int = 5,
+        max_filesize: Optional[int] = None
     ):
         """
         Initialize the scraper.
@@ -172,12 +173,15 @@ class WazeAPIDataScraper:
             full_mode: Whether to preserve all alert properties.
             collate: Whether to maintain a single file with deduplicated alerts.
             max_retries: Maximum number of retry attempts for API calls.
+            max_filesize: Maximum file size in bytes (if set).
         """
         self.bounds = bounds
         self.alert_types = [alert_type.upper() for alert_type in alert_types]
         self.full_mode = full_mode
         self.collate = collate
         self.max_retries = max_retries
+        self.max_filesize = max_filesize
+        self.current_filesize = 0
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -203,7 +207,8 @@ class WazeAPIDataScraper:
         except Exception as e:
             logger.warning(f"Unable to load schema file: {str(e)}")
             
-        logger.info(f"Initialized API scraper with bounds: {bounds}, alert types: {self.alert_types}, full mode: {self.full_mode}, collate: {self.collate}, max retries: {self.max_retries}")
+        logger.info(f"Initialized API scraper with bounds: {bounds}, alert types: {self.alert_types}, full mode: {self.full_mode}, collate: {self.collate}, max retries: {self.max_retries}" + 
+                  (f", max filesize: {format_filesize(self.max_filesize)}" if self.max_filesize else ""))
 
     def validate_data(self, data: Dict) -> bool:
         """
@@ -622,6 +627,47 @@ class WazeAPIDataScraper:
         
         return path.with_name(f"{stem}_{timestamp}{path.suffix}")
 
+    def _check_filesize_limit(self, additional_bytes: int, output_path: str) -> bool:
+        """
+        Check if adding more data would exceed the maximum filesize limit.
+        
+        Args:
+            additional_bytes: Additional bytes to be added
+            output_path: Path to the output file
+            
+        Returns:
+            True if the addition is allowed, False if it would exceed the limit
+        """
+        if not self.max_filesize:
+            return True
+            
+        # For collate mode, check the total file size
+        if self.collate and Path(output_path).exists():
+            current_size = Path(output_path).stat().st_size
+            new_size = current_size + additional_bytes
+            
+            if new_size > self.max_filesize:
+                logger.warning(f"Max filesize limit reached: {format_filesize(self.max_filesize)}. " +
+                              f"Current: {format_filesize(current_size)}, " +
+                              f"Would add: {format_filesize(additional_bytes)}")
+                return False
+        
+        # For non-collate mode, track total size of all generated files
+        elif not self.collate:
+            new_size = self.current_filesize + additional_bytes
+            
+            if new_size > self.max_filesize:
+                logger.warning(f"Max total filesize limit reached: {format_filesize(self.max_filesize)}. " +
+                              f"Current total: {format_filesize(self.current_filesize)}, " +
+                              f"Would add: {format_filesize(additional_bytes)}")
+                return False
+                
+        # Update current size tracking (non-collate mode)
+        if not self.collate:
+            self.current_filesize += additional_bytes
+            
+        return True
+
     def save_to_geojson(self, data: List[Dict], output_path: str = DEFAULT_OUTPUT_PREFIX, append: bool = True):
         """
         Save extracted data to a GeoJSON file.
@@ -728,9 +774,18 @@ class WazeAPIDataScraper:
             except Exception as e:
                 logger.error(f"Error when appending to existing file: {str(e)}")
         
+        # Convert to JSON string to estimate size
+        json_content = json.dumps(feature_collection)
+        content_size = len(json_content.encode('utf-8'))
+        
+        # Check if adding this data would exceed the max filesize
+        if not self._check_filesize_limit(content_size, output_path):
+            logger.warning(f"Skipping save operation due to filesize limit. Would exceed max filesize: {format_filesize(self.max_filesize)}")
+            return
+        
         # Save to file
         with open(output_path, "w") as f:
-            geojson.dump(feature_collection, f)
+            f.write(json_content)
             
         logger.success(f"Saved {len(data)} records to {output_path}")
 
@@ -788,8 +843,19 @@ class WazeAPIDataScraper:
             except Exception as e:
                 logger.error(f"Error when appending to existing file: {str(e)}")
         
+        # Estimate CSV size by converting to string
+        csv_content = df.to_csv(index=False)
+        content_size = len(csv_content.encode('utf-8'))
+        
+        # Check if adding this data would exceed the max filesize
+        if not self._check_filesize_limit(content_size, output_path):
+            logger.warning(f"Skipping save operation due to filesize limit. Would exceed max filesize: {format_filesize(self.max_filesize)}")
+            return
+        
         # Save to CSV
-        df.to_csv(output_path, index=False)
+        with open(output_path, "w") as f:
+            f.write(csv_content)
+        
         logger.success(f"Saved {len(data)} records to {output_path}")
 
     def save_to_json(self, data: List[Dict], output_path: str, append: bool = True):
@@ -856,9 +922,18 @@ class WazeAPIDataScraper:
             except Exception as e:
                 logger.error(f"Error when appending to existing file: {str(e)}")
         
+        # Convert to string to estimate size
+        json_content = json.dumps(data, indent=2)
+        content_size = len(json_content.encode('utf-8'))
+        
+        # Check if adding this data would exceed the max filesize
+        if not self._check_filesize_limit(content_size, output_path):
+            logger.warning(f"Skipping save operation due to filesize limit. Would exceed max filesize: {format_filesize(self.max_filesize)}")
+            return
+        
         # Save to file
         with open(output_path, "w") as f:
-            json.dump(data, f, indent=2)
+            f.write(json_content)
             
         logger.success(f"Saved {len(data)} records to {output_path}")
 
@@ -960,6 +1035,67 @@ class WazeAPIDataScraper:
         return None, 0
 
 
+def format_filesize(size_bytes: int) -> str:
+    """
+    Format a filesize in bytes to a human-readable string.
+    
+    Args:
+        size_bytes: Size in bytes
+        
+    Returns:
+        Human-readable string (e.g., "1.23 MB")
+    """
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    
+def parse_filesize(filesize_str: str) -> int:
+    """
+    Parse a filesize string into bytes.
+    
+    Examples:
+    - "1024" (bytes)
+    - "2kb" (kilobytes)
+    - "5mb" (megabytes)
+    - "1gb" (gigabytes)
+    
+    Args:
+        filesize_str: String representing the filesize
+        
+    Returns:
+        Size in bytes
+    """
+    if not filesize_str:
+        return 0
+        
+    filesize_str = filesize_str.strip().lower()
+    
+    # Define multipliers
+    multipliers = {
+        'kb': 1024,
+        'mb': 1024 * 1024,
+        'gb': 1024 * 1024 * 1024,
+        'tb': 1024 * 1024 * 1024 * 1024
+    }
+    
+    try:
+        # Check if the string ends with a unit
+        for unit, multiplier in multipliers.items():
+            if filesize_str.endswith(unit):
+                # Extract the number part and convert to bytes
+                return int(float(filesize_str[:-len(unit)]) * multiplier)
+        
+        # If no unit is specified, assume it's bytes
+        return int(float(filesize_str))
+    
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Invalid filesize format: {filesize_str}. Please use a number or a number with unit (kb, mb, gb).")
+
 def parse_runtime(runtime_str: str) -> int:
     """
     Parse a runtime string in format "99d 99h 99m 99s" into seconds.
@@ -1051,6 +1187,7 @@ def run(
     force: bool = typer.Option(False, "--force", help="Force overwrite/append to existing collate files"),
     version: Optional[bool] = typer.Option(None, "--version", callback=version_callback, is_eager=True, help="Show version information and exit"),
     max_retries: int = typer.Option(5, "--max-retries", help="Maximum number of retry attempts for API calls"),
+    max_filesize: str = typer.Option(None, "--max-filesize", help="Maximum total file size in bytes or with units (e.g., '10mb', '1gb')"),
 ):
     """Run the Waze police data API scraper."""
     stats_saved = False  # Track if session stats have been saved
@@ -1102,7 +1239,8 @@ def run(
             alert_types=alert_types, 
             full_mode=full, 
             collate=collate_mode,
-            max_retries=max_retries
+            max_retries=max_retries,
+            max_filesize=parse_filesize(max_filesize) if max_filesize else None
         )
         
         # Parse runtime if provided
