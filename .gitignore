@@ -4,3 +4,5 @@ __pycache__
 ***.egg-info
 
 police_*
+session_*
+test_collate*

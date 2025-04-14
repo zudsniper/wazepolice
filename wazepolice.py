@@ -21,6 +21,8 @@ import json
 import time
 import httpx
 import re
+import random
+import statistics
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -32,7 +34,7 @@ import typer
 from loguru import logger
 
 # Version and author information
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 AUTHOR = "@zudsniper"
 GITHUB = "https://github.com/zudsniper/wazepolice"
 
@@ -44,6 +46,110 @@ DEFAULT_ALERT_TYPES = ["POLICE"]  # Default alert types to filter
 # Define default output names
 DEFAULT_OUTPUT_PREFIX = "all"
 
+class SessionStats:
+    """Track statistics for a scraping session."""
+    
+    def __init__(self, bounds: Tuple[float, float, float, float], alert_types: List[str]):
+        """Initialize session statistics."""
+        self.start_time = datetime.now()
+        self.bounds = bounds
+        self.alert_types = alert_types
+        self.api_calls = 0
+        self.api_failures = 0
+        self.api_retries = 0
+        self.api_response_times = []
+        self.data_sizes = []
+        self.new_alerts_per_call = []
+        self.total_alerts_found = 0
+        self.backoff_incidents = 0
+        self.actual_intervals = []
+    
+    def add_api_call(self, success: bool, response_time: float, data_size: int = 0):
+        """Record an API call."""
+        self.api_calls += 1
+        if success:
+            self.api_response_times.append(response_time)
+            self.data_sizes.append(data_size)
+        else:
+            self.api_failures += 1
+    
+    def add_retry(self):
+        """Record an API retry."""
+        self.api_retries += 1
+    
+    def add_backoff(self):
+        """Record a backoff incident."""
+        self.backoff_incidents += 1
+    
+    def add_new_alerts(self, count: int):
+        """Record number of new alerts."""
+        self.new_alerts_per_call.append(count)
+        self.total_alerts_found += count
+    
+    def add_interval(self, interval: float):
+        """Record actual interval between API calls."""
+        self.actual_intervals.append(interval)
+    
+    def to_dict(self) -> Dict:
+        """Convert statistics to a dictionary."""
+        end_time = datetime.now()
+        runtime = (end_time - self.start_time).total_seconds()
+        
+        # Calculate averages safely
+        avg_response_time = statistics.mean(self.api_response_times) if self.api_response_times else 0
+        avg_data_size = statistics.mean(self.data_sizes) if self.data_sizes else 0
+        avg_new_alerts = statistics.mean(self.new_alerts_per_call) if self.new_alerts_per_call else 0
+        avg_interval = statistics.mean(self.actual_intervals) if self.actual_intervals else 0
+        
+        # Calculate medians safely
+        median_response_time = statistics.median(self.api_response_times) if len(self.api_response_times) > 1 else avg_response_time
+        median_data_size = statistics.median(self.data_sizes) if len(self.data_sizes) > 1 else avg_data_size
+        median_new_alerts = statistics.median(self.new_alerts_per_call) if len(self.new_alerts_per_call) > 1 else avg_new_alerts
+        median_interval = statistics.median(self.actual_intervals) if len(self.actual_intervals) > 1 else avg_interval
+        
+        return {
+            "session_info": {
+                "start_time": self.start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+                "runtime_seconds": runtime,
+                "bounds": list(self.bounds),
+                "alert_types": self.alert_types
+            },
+            "api_stats": {
+                "total_calls": self.api_calls,
+                "successful_calls": self.api_calls - self.api_failures,
+                "failed_calls": self.api_failures,
+                "retries": self.api_retries,
+                "backoff_incidents": self.backoff_incidents,
+                "success_rate": (self.api_calls - self.api_failures) / self.api_calls if self.api_calls > 0 else 0
+            },
+            "performance": {
+                "avg_response_time_seconds": avg_response_time,
+                "median_response_time_seconds": median_response_time,
+                "avg_data_size_bytes": avg_data_size,
+                "median_data_size_bytes": median_data_size,
+                "avg_actual_interval_seconds": avg_interval,
+                "median_actual_interval_seconds": median_interval
+            },
+            "data_stats": {
+                "total_alerts_found": self.total_alerts_found,
+                "avg_new_alerts_per_call": avg_new_alerts,
+                "median_new_alerts_per_call": median_new_alerts
+            }
+        }
+    
+    def save(self, path: Optional[str] = None):
+        """Save session statistics to a JSON file."""
+        if path is None:
+            timestamp = int(time.time())
+            path = f"session_{timestamp}.json"
+        
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+        
+        logger.success(f"Session statistics saved to {path}")
+        return path
+
 class WazeAPIDataScraper:
     """Extracts police report coordinates from Waze by using internal API endpoints."""
 
@@ -53,7 +159,8 @@ class WazeAPIDataScraper:
         schema_path: str = Path(__file__).parent / "schema" / "wazedata.json",
         alert_types: List[str] = DEFAULT_ALERT_TYPES,
         full_mode: bool = False,
-        collate: bool = False
+        collate: bool = False,
+        max_retries: int = 5
     ):
         """
         Initialize the scraper.
@@ -64,11 +171,13 @@ class WazeAPIDataScraper:
             alert_types: List of alert types to extract.
             full_mode: Whether to preserve all alert properties.
             collate: Whether to maintain a single file with deduplicated alerts.
+            max_retries: Maximum number of retry attempts for API calls.
         """
         self.bounds = bounds
         self.alert_types = [alert_type.upper() for alert_type in alert_types]
         self.full_mode = full_mode
         self.collate = collate
+        self.max_retries = max_retries
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -82,6 +191,9 @@ class WazeAPIDataScraper:
             "Connection": "keep-alive",
         }
         
+        # Session statistics tracking
+        self.session_stats = SessionStats(bounds, self.alert_types)
+        
         # Load JSON schema
         self.schema = None
         try:
@@ -91,7 +203,7 @@ class WazeAPIDataScraper:
         except Exception as e:
             logger.warning(f"Unable to load schema file: {str(e)}")
             
-        logger.info(f"Initialized API scraper with bounds: {bounds}, alert types: {self.alert_types}, full mode: {self.full_mode}, collate: {self.collate}")
+        logger.info(f"Initialized API scraper with bounds: {bounds}, alert types: {self.alert_types}, full mode: {self.full_mode}, collate: {self.collate}, max retries: {self.max_retries}")
 
     def validate_data(self, data: Dict) -> bool:
         """
@@ -118,9 +230,13 @@ class WazeAPIDataScraper:
             logger.error(f"Error during schema validation: {str(e)}")
             return False
 
-    def extract_police_data(self) -> List[Dict]:
+    def extract_police_data(self, max_runtime=None, start_time=None) -> List[Dict]:
         """
         Extract alert data from Waze's API based on the specified alert types.
+
+        Args:
+            max_runtime: Maximum runtime in seconds (if set)
+            start_time: Start time of the scraping session (needed for max_runtime check)
 
         Returns:
             List of dictionaries containing alert data.
@@ -139,9 +255,10 @@ class WazeAPIDataScraper:
             logger.debug(f"Using primary endpoint: {primary_endpoint}")
             
             with httpx.Client(timeout=30, follow_redirects=True) as client:
-                response = client.get(primary_endpoint, headers=self.headers)
+                # Make request with exponential backoff
+                response, response_time = self._make_request(client, primary_endpoint, max_runtime, start_time)
                 
-                if response.status_code == 200:
+                if response and response.status_code == 200:
                     try:
                         data = response.json()
                         
@@ -170,8 +287,6 @@ class WazeAPIDataScraper:
                                 logger.success(f"Successfully extracted {len(results)} alerts using format v2")
                     except json.JSONDecodeError:
                         logger.warning(f"Response was not valid JSON from primary endpoint")
-                else:
-                    logger.warning(f"Failed to get data from primary endpoint: {response.status_code}")
                 
                 # If no results were found, try fallback methods
                 if not results:
@@ -187,10 +302,15 @@ class WazeAPIDataScraper:
                     
                     # Try each fallback endpoint
                     for endpoint in fallback_endpoints:
+                        # Check if max runtime would be exceeded
+                        if max_runtime and start_time and (time.time() - start_time) > max_runtime:
+                            logger.warning("Maximum runtime reached during fallback attempts. Stopping.")
+                            break
+                            
                         logger.debug(f"Trying fallback endpoint: {endpoint}")
-                        response = client.get(endpoint, headers=self.headers)
+                        response, response_time = self._make_request(client, endpoint, max_runtime, start_time)
                         
-                        if response.status_code == 200:
+                        if response and response.status_code == 200:
                             try:
                                 data = response.json()
                                 
@@ -221,16 +341,17 @@ class WazeAPIDataScraper:
                                         break
                             except json.JSONDecodeError:
                                 logger.warning(f"Response was not valid JSON from {endpoint}")
-                        else:
-                            logger.warning(f"Failed to get data from {endpoint}: {response.status_code}")
                     
                     # If still no results, try last fallback method
-                    if not results:
+                    if not results and (not max_runtime or not start_time or (time.time() - start_time) <= max_runtime):
                         logger.info("All endpoints failed. Trying final fallback method...")
-                        results = self._try_fallback_method(timestamp, client)
+                        results = self._try_fallback_method(timestamp, client, max_runtime, start_time)
                 
         except Exception as e:
             logger.error(f"Error extracting data: {str(e)}")
+        
+        # Update session stats with the number of new alerts found
+        self.session_stats.add_new_alerts(len(results))
             
         return results
 
@@ -367,8 +488,16 @@ class WazeAPIDataScraper:
                 
         return results
 
-    def _try_fallback_method(self, timestamp, client=None):
-        """Try a different approach based on another observed API pattern."""
+    def _try_fallback_method(self, timestamp, client=None, max_runtime=None, start_time=None):
+        """
+        Try a different approach based on another observed API pattern.
+        
+        Args:
+            timestamp: Current timestamp
+            client: httpx.Client if available
+            max_runtime: Maximum runtime in seconds (if set)
+            start_time: Start time of the scraping session (needed for max_runtime check)
+        """
         results = []
         now = int(time.time() * 1000)  # Current time in milliseconds
         
@@ -380,11 +509,11 @@ class WazeAPIDataScraper:
             
             if client is None:
                 with httpx.Client(timeout=30, follow_redirects=True) as client:
-                    response = client.get(url, headers=self.headers)
+                    response, response_time = self._make_request(client, url, max_runtime, start_time)
             else:
-                response = client.get(url, headers=self.headers)
+                response, response_time = self._make_request(client, url, max_runtime, start_time)
             
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 try:
                     data = response.json()
                     
@@ -582,6 +711,10 @@ class WazeAPIDataScraper:
                     all_features = list(unique_features.values())
                     feature_collection = geojson.FeatureCollection(all_features)
                     
+                    # Update session stats with the count of new unique alerts
+                    if self.collate:
+                        self.session_stats.add_new_alerts(new_unique_count)
+                    
                     # Only log if we actually added new data
                     if new_unique_count > 0:
                         logger.info(f"Collated data with {new_unique_count} new unique alerts, total: {len(all_features)}")
@@ -634,6 +767,10 @@ class WazeAPIDataScraper:
                     # Count new unique alerts
                     new_ids = set(df["id"].values)
                     new_unique_count = len(new_ids - existing_ids)
+                    
+                    # Update session stats with the count of new unique alerts
+                    if self.collate:
+                        self.session_stats.add_new_alerts(new_unique_count)
                     
                     # Concatenate and drop duplicates, keeping the latest occurrence
                     combined_df = pd.concat([existing_df, df], ignore_index=True)
@@ -703,6 +840,10 @@ class WazeAPIDataScraper:
                     # Convert back to list
                     data = list(unique_alerts.values())
                     
+                    # Update session stats with the count of new unique alerts
+                    if self.collate:
+                        self.session_stats.add_new_alerts(new_unique_count)
+                    
                     # Only log if we actually added new data
                     if new_unique_count > 0:
                         logger.info(f"Collated data with {new_unique_count} new unique alerts, total: {len(data)}")
@@ -747,6 +888,76 @@ class WazeAPIDataScraper:
         else:
             # For non-collate mode, include alert types and timestamp
             return f"{alert_str}{full_suffix}_{timestamp}{extension}"
+
+    def _make_request(self, client, url, max_runtime=None, start_time=None):
+        """
+        Make an HTTP request with exponential backoff.
+        
+        Args:
+            client: The httpx.Client to use
+            url: The URL to request
+            max_runtime: Maximum runtime in seconds (if set)
+            start_time: Start time of the scraping session (needed for max_runtime check)
+            
+        Returns:
+            Tuple of (response, response_time) if successful, (None, 0) if failed after retries
+        """
+        base_delay = 2  # Base delay in seconds
+        max_delay = 60  # Maximum delay in seconds
+        
+        for attempt in range(1, self.max_retries + 1):
+            # Check if we've exceeded the maximum runtime
+            if max_runtime and start_time and (time.time() - start_time) > max_runtime:
+                logger.warning("Maximum runtime reached during retry attempt. Aborting.")
+                return None, 0
+                
+            try:
+                # Record the start time for response time calculation
+                request_start = time.time()
+                response = client.get(url, headers=self.headers, timeout=30)
+                response_time = time.time() - request_start
+                
+                # Log the attempt
+                if response.status_code == 200:
+                    if attempt > 1:
+                        logger.success(f"Request succeeded on attempt {attempt}")
+                    self.session_stats.add_api_call(True, response_time, len(response.content))
+                    return response, response_time
+                else:
+                    # If we get a response but it's not 200, log it
+                    logger.warning(f"Request failed with status {response.status_code} on attempt {attempt}/{self.max_retries}")
+                    self.session_stats.add_api_call(False, 0)
+                    
+                    if attempt == self.max_retries:
+                        logger.error(f"All retry attempts failed for URL: {url}")
+                        return None, 0
+            except Exception as e:
+                # If we get an exception, log it
+                logger.warning(f"Request failed with exception on attempt {attempt}/{self.max_retries}: {str(e)}")
+                self.session_stats.add_api_call(False, 0)
+                
+                if attempt == self.max_retries:
+                    logger.error(f"All retry attempts failed for URL: {url}")
+                    return None, 0
+            
+            # Calculate delay with exponential backoff and jitter
+            delay = min(base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1), max_delay)
+            
+            # Log and record the backoff
+            logger.info(f"Backing off for {delay:.2f} seconds before retry {attempt + 1}/{self.max_retries}")
+            self.session_stats.add_retry()
+            self.session_stats.add_backoff()
+            
+            # Check again if we've exceeded the maximum runtime
+            if max_runtime and start_time and (time.time() - start_time + delay) > max_runtime:
+                logger.warning("Maximum runtime would be exceeded during backoff. Aborting.")
+                return None, 0
+                
+            # Wait before retrying
+            time.sleep(delay)
+            
+        # This should not be reached due to the returns in the loop
+        return None, 0
 
 
 def parse_runtime(runtime_str: str) -> int:
@@ -839,8 +1050,10 @@ def run(
     collate: Optional[str] = typer.Option(None, "--collate", help="Maintain a single output file with deduplicated alerts. Optional filepath can be provided"),
     force: bool = typer.Option(False, "--force", help="Force overwrite/append to existing collate files"),
     version: Optional[bool] = typer.Option(None, "--version", callback=version_callback, is_eager=True, help="Show version information and exit"),
+    max_retries: int = typer.Option(5, "--max-retries", help="Maximum number of retry attempts for API calls"),
 ):
     """Run the Waze police data API scraper."""
+    stats_saved = False  # Track if session stats have been saved
     try:
         # Print version information
         logger.info(f"WazePolice Scraper v{VERSION} by {AUTHOR}")
@@ -888,7 +1101,8 @@ def run(
             schema_path=schema, 
             alert_types=alert_types, 
             full_mode=full, 
-            collate=collate_mode
+            collate=collate_mode,
+            max_retries=max_retries
         )
         
         # Parse runtime if provided
@@ -931,20 +1145,43 @@ def run(
                     logger.error(f"Collate file '{output}' already exists and is not empty. Use --force to append to it anyway.")
                     raise typer.Exit(code=1)
         
+        # Function to save session stats at exit
+        def save_session_stats():
+            nonlocal stats_saved
+            if collate_mode and not stats_saved:
+                timestamp = int(time.time())
+                stats_file = f"session_{timestamp}.json"
+                scraper.session_stats.save(stats_file)
+                stats_saved = True
+        
         # Create a long-lived client for multiple requests
         with httpx.Client(timeout=30, follow_redirects=True) as client:
             if interval > 0:
                 logger.info(f"Starting continuous scraping with interval: {interval} seconds")
                 start_time = time.time()
+                last_call_time = start_time
+                stats_saved = False
+                
                 try:
                     while True:
                         # Check if we've exceeded the maximum runtime
-                        if max_runtime and (time.time() - start_time) > max_runtime:
+                        current_time = time.time()
+                        elapsed = current_time - start_time
+                        
+                        if max_runtime and elapsed > max_runtime:
                             logger.info(f"Maximum runtime of {max_runtime} seconds reached. Stopping.")
                             break
                             
+                        # Calculate time since last API call
+                        time_since_last_call = current_time - last_call_time
+                        if interval > 0 and time_since_last_call > 0:
+                            scraper.session_stats.add_interval(time_since_last_call)
+                            
+                        # Update for next iteration
+                        last_call_time = current_time
+                            
                         try:
-                            data = scraper.extract_police_data()
+                            data = scraper.extract_police_data(max_runtime, start_time)
                             
                             # Save based on the determined format
                             if format == "geojson":
@@ -973,31 +1210,50 @@ def run(
                                 time.sleep(interval)
                         except httpx.HTTPError as e:
                             logger.error(f"HTTP error during scraping: {str(e)}")
-                            time.sleep(10)  # Short delay before retrying
+                            # Don't sleep here since the exponential backoff already handles delays
                         except Exception as e:
                             logger.error(f"Error during scraping: {str(e)}")
-                            time.sleep(10)  # Short delay before retrying
+                            # Brief delay before retrying after an unexpected error
+                            time.sleep(5)  
                 except KeyboardInterrupt:
                     logger.info("Scraping stopped by user")
+                except Exception as e:
+                    logger.error(f"Scraping stopped due to error: {str(e)}")
+                finally:
+                    # Always save session stats at the end if in collate mode
+                    save_session_stats()
             else:
                 logger.info("Running one-time scraping")
-                data = scraper.extract_police_data()
-                
-                # Save based on the determined format
-                if format == "geojson":
-                    scraper.save_to_geojson(data, output)
-                elif format == "csv":
-                    scraper.save_to_csv(data, output)
-                else:
-                    # Default to JSON
-                    scraper.save_to_json(data, output)
+                stats_saved = False
+                try:
+                    start_time = time.time()
+                    data = scraper.extract_police_data(max_runtime, start_time)
                     
-                # Save raw data if requested
-                if raw_output and hasattr(scraper, "last_raw_data"):
-                    scraper.save_to_raw_json(scraper.last_raw_data, raw_output)
+                    # Save based on the determined format
+                    if format == "geojson":
+                        scraper.save_to_geojson(data, output)
+                    elif format == "csv":
+                        scraper.save_to_csv(data, output)
+                    else:
+                        # Default to JSON
+                        scraper.save_to_json(data, output)
+                        
+                    # Save raw data if requested
+                    if raw_output and hasattr(scraper, "last_raw_data"):
+                        scraper.save_to_raw_json(scraper.last_raw_data, raw_output)
+                except Exception as e:
+                    logger.error(f"Scraping failed: {str(e)}")
+                finally:
+                    # Always save session stats at the end if in collate mode
+                    save_session_stats()
+                    stats_saved = True
             
     except Exception as e:
         logger.error(f"Error: {str(e)}")
+        # Try to save session stats if possible
+        if 'scraper' in locals() and hasattr(scraper, 'session_stats') and collate_mode and not stats_saved:
+            scraper.session_stats.save(f"session_error_{int(time.time())}.json")
+            stats_saved = True
         raise typer.Exit(code=1)
 
 
