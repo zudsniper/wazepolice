@@ -1,0 +1,10 @@
+playwright
+pandas
+python-dotenv
+loguru
+geojson
+typer
+folium
+requests
+httpx
+jsonschema

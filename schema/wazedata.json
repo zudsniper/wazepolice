@@ -1,0 +1,177 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Minimized Waze Data Feed Schema",
+    "description": "A minimized schema for Waze data feed with only essential required fields.",
+    "type": "object",
+    "properties": {
+      "alerts": {
+        "description": "An array of alert objects.",
+        "type": "array",
+        "items": {
+          "$ref": "#/definitions/alertItem"
+        }
+      },
+      "endTimeMillis": {
+        "description": "End timestamp of the data window in milliseconds since epoch.",
+        "type": "integer"
+      },
+      "startTimeMillis": {
+        "description": "Start timestamp of the data window in milliseconds since epoch.",
+        "type": "integer"
+      },
+      "startTime": {
+        "description": "Formatted start time string.",
+        "type": "string"
+      },
+      "endTime": {
+        "description": "Formatted end time string.",
+        "type": "string"
+      },
+      "jams": {
+        "description": "An array of jam objects.",
+        "type": "array",
+        "items": {
+          "$ref": "#/definitions/jamItem"
+        }
+      }
+    },
+    "required": [
+      "alerts",
+      "startTimeMillis",
+      "endTimeMillis"
+    ],
+    "definitions": {
+      "location": {
+        "description": "Geographic coordinates.",
+        "type": "object",
+        "properties": {
+          "x": { "description": "Longitude.", "type": "number" },
+          "y": { "description": "Latitude.", "type": "number" }
+        },
+        "required": ["x", "y"],
+        "additionalProperties": false
+      },
+      "commentItem": {
+        "description": "Represents a comment or thumbs-up action on an alert.",
+        "type": "object",
+        "properties": {
+          "reportBy": { "description": "User who made the comment/action (optional).", "type": "string" },
+          "reportMillis": { "description": "Timestamp of the comment/action in milliseconds since epoch.", "type": "integer" },
+          "text": { "description": "Text of the comment (often empty for thumbs-up).", "type": "string" },
+          "isThumbsUp": { "description": "Indicates if this action was a thumbs-up.", "type": "boolean" }
+        },
+        "required": ["reportMillis"],
+        "additionalProperties": false
+      },
+      "alertItem": {
+        "description": "Represents a single Waze alert.",
+        "type": "object",
+        "properties": {
+          "country": { "description": "Country code (e.g., US).", "type": "string" },
+          "city": { "description": "City and state/province (optional).", "type": "string" },
+          "reportRating": { "description": "Rating of the report.", "type": "integer" },
+          "reportByMunicipalityUser": { "description": "Indicates if the report was by a municipality user (represented as a string 'true' or 'false').", "type": "string" },
+          "reliability": { "description": "Reliability score of the alert.", "type": "integer" },
+          "type": { "description": "Type of the alert.", "type": "string" },
+          "fromNodeId": { "description": "Originating node ID for the alert segment (can be 0 if not applicable).", "type": "integer" },
+          "uuid": { "description": "Unique identifier for the alert instance.", "type": "string" },
+          "speed": { "description": "Associated speed (often 0 for alerts).", "type": "integer" },
+          "reportMood": { "description": "Mood indicator associated with the report.", "type": "integer" },
+          "subtype": { "description": "Subtype of the alert (can be an empty string).", "type": "string" },
+          "provider": { "description": "Source provider of the alert (optional).", "type": "string" },
+          "street": { "description": "Street name associated with the alert (optional).", "type": "string" },
+          "providerId": { "description": "Provider-specific identifier (optional).", "type": "string" },
+          "additionalInfo": { "description": "Additional textual information (often empty).", "type": "string" },
+          "toNodeId": { "description": "Destination node ID for the alert segment (can be 0 if not applicable).", "type": "integer" },
+          "id": { "description": "Unique identifier combining type and UUID.", "type": "string" },
+          "reportBy": { "description": "User or entity who reported the alert (optional).", "type": "string" },
+          "inscale": { "description": "Indicates if the alert is considered 'in scale'.", "type": "boolean" },
+          "confidence": { "description": "Confidence level of the alert.", "type": "integer" },
+          "roadType": { "description": "Type of the road (optional).", "type": "integer" },
+          "magvar": { "description": "Magnetic variation or similar directional indicator.", "type": "integer" },
+          "wazeData": { "description": "Waze-specific data string, often containing coordinates and UUID.", "type": "string" },
+          "reportDescription": { "description": "Textual description of the report (optional, can be empty).", "type": "string" },
+          "location": { "$ref": "#/definitions/location" },
+          "pubMillis": { "description": "Publication timestamp in milliseconds since epoch.", "type": "integer" },
+          "nThumbsUp": { "description": "Number of thumbs up received (optional).", "type": "integer" },
+          "nComments": { "description": "Number of comments received (optional).", "type": "integer" },
+          "comments": {
+            "description": "List of comments or thumbs-up actions (optional).",
+            "type": "array",
+            "items": { "$ref": "#/definitions/commentItem" }
+          },
+          "nearBy": { "description": "Nearby location name (optional).", "type": "string" }
+        },
+        "required": [
+          "type",
+          "uuid",
+          "location",
+          "pubMillis"
+        ],
+        "additionalProperties": false
+      },
+      "segment": {
+        "description": "Defines a single road segment within a jam.",
+        "type": "object",
+        "properties": {
+          "fromNode": { "description": "Originating node ID of the segment.", "type": "integer" },
+          "ID": { "description": "Identifier for the segment.", "type": "integer" },
+          "toNode": { "description": "Destination node ID of the segment.", "type": "integer" },
+          "isForward": { "description": "Indicates the direction of the segment relative to its definition.", "type": "boolean" }
+        },
+        "required": ["fromNode", "ID", "toNode"],
+        "additionalProperties": false
+      },
+      "jamItem": {
+        "description": "Represents a single Waze traffic jam.",
+        "type": "object",
+        "properties": {
+          "country": { "description": "Country code (e.g., US).", "type": "string" },
+          "city": { "description": "City and state/province.", "type": "string" },
+          "line": {
+            "description": "Coordinates defining the jam polyline of the jam.",
+            "type": "array",
+            "items": { "$ref": "#/definitions/location" }
+          },
+          "speedKMH": { "description": "Average speed of the jam in kilometers per hour.", "type": "number" },
+          "type": { "description": "Type indicator for the jam (e.g., NONE).", "type": "string" },
+          "blockingAlertID": { "description": "ID of the alert blocking this jam segment (optional).", "type": "integer" },
+          "blockExpiration": { "description": "Timestamp when the block expires in milliseconds since epoch (optional).", "type": "integer" },
+          "uuid": { "description": "Unique identifier for the jam.", "type": "integer" },
+          "endNode": { "description": "Name of the end node/location (optional).", "type": "string" },
+          "speed": { "description": "Average speed of the jam (units may vary, possibly m/s).", "type": "number" },
+          "segments": {
+            "description": "Segments composing the jam.",
+            "type": "array",
+            "items": { "$ref": "#/definitions/segment" }
+          },
+          "startNode": { "description": "Name of the start node/location (optional).", "type": "string" },
+          "street": { "description": "Street name associated with the jam.", "type": "string" },
+          "id": { "description": "Unique identifier for the jam (same as uuid).", "type": "integer" },
+          "blockStartTime": { "description": "Timestamp when the block started in milliseconds since epoch (optional).", "type": "integer" },
+          "blockUpdate": { "description": "Timestamp of the last block update in milliseconds since epoch (optional).", "type": "integer" },
+          "severity": { "description": "Severity score of the jam.", "type": "integer" },
+          "level": { "description": "Traffic level indicator for the jam.", "type": "integer" },
+          "blockType": { "description": "Type of the block causing the jam (optional).", "type": "string" },
+          "length": { "description": "Length of the jam in meters.", "type": "integer" },
+          "turnType": { "description": "Turn type associated with the jam (e.g., NONE).", "type": "string" },
+          "blockingAlertUuid": { "description": "UUID of the alert blocking this jam segment (optional).", "type": "string" },
+          "roadType": { "description": "Type of the road.", "type": "integer" },
+          "delay": { "description": "Delay caused by the jam in seconds (-1 if blocked).", "type": "integer" },
+          "blockDescription": { "description": "Description of the block causing the jam (optional).", "type": "string" },
+          "updateMillis": { "description": "Timestamp of the last jam update in milliseconds since epoch.", "type": "integer" },
+          "causeAlert": {
+            "description": "The alert that caused this jam (optional).",
+            "$ref": "#/definitions/alertItem"
+          },
+          "pubMillis": { "description": "Publication timestamp in milliseconds since epoch.", "type": "integer" }
+        },
+        "required": [
+          "uuid",
+          "pubMillis"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+  
