@@ -11,6 +11,10 @@ Usage:
     python wazepolice.py --runtime "1d 2h 30m 15s"
     python wazepolice.py --filter "POLICE,ACCIDENT,HAZARD"
     python wazepolice.py --full
+    python wazepolice.py --collate
+    python wazepolice.py --collate custom_output.json
+    python wazepolice.py --collate existing_file.json --force
+    python wazepolice.py --version
 """
 
 import json
@@ -28,15 +32,17 @@ import typer
 from loguru import logger
 
 # Version and author information
-VERSION = "1.2.0"
+VERSION = "2.0.0"
 AUTHOR = "@zudsniper"
+GITHUB = "https://github.com/zudsniper/wazepolice"
 
 # Default coordinates (can be modified via command-line args)
 DEFAULT_BOUNDS = (33.7490, -84.3880, 36.1627, -86.7816)  # Atlanta to Nashville
-DEFAULT_OUTPUT = "police.json"  # Changed default to JSON
 DEFAULT_INTERVAL = 600  # 10 minutes
 DEFAULT_ALERT_TYPES = ["POLICE"]  # Default alert types to filter
 
+# Define default output names
+DEFAULT_OUTPUT_PREFIX = "all"
 
 class WazeAPIDataScraper:
     """Extracts police report coordinates from Waze by using internal API endpoints."""
@@ -46,7 +52,8 @@ class WazeAPIDataScraper:
         bounds: Tuple[float, float, float, float] = DEFAULT_BOUNDS,
         schema_path: str = Path(__file__).parent / "schema" / "wazedata.json",
         alert_types: List[str] = DEFAULT_ALERT_TYPES,
-        full_mode: bool = False
+        full_mode: bool = False,
+        collate: bool = False
     ):
         """
         Initialize the scraper.
@@ -56,10 +63,12 @@ class WazeAPIDataScraper:
             schema_path: Path to the JSON schema file.
             alert_types: List of alert types to extract.
             full_mode: Whether to preserve all alert properties.
+            collate: Whether to maintain a single file with deduplicated alerts.
         """
         self.bounds = bounds
         self.alert_types = [alert_type.upper() for alert_type in alert_types]
         self.full_mode = full_mode
+        self.collate = collate
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -82,7 +91,7 @@ class WazeAPIDataScraper:
         except Exception as e:
             logger.warning(f"Unable to load schema file: {str(e)}")
             
-        logger.info(f"Initialized API scraper with bounds: {bounds}, alert types: {self.alert_types}, full mode: {self.full_mode}")
+        logger.info(f"Initialized API scraper with bounds: {bounds}, alert types: {self.alert_types}, full mode: {self.full_mode}, collate: {self.collate}")
 
     def validate_data(self, data: Dict) -> bool:
         """
@@ -478,9 +487,13 @@ class WazeAPIDataScraper:
         if self.full_mode and "_full" not in stem:
             stem = f"{stem}_full"
             
+        # Skip adding timestamp if collate mode is enabled
+        if self.collate:
+            return path.with_name(f"{stem}{path.suffix}")
+        
         return path.with_name(f"{stem}_{timestamp}{path.suffix}")
 
-    def save_to_geojson(self, data: List[Dict], output_path: str = DEFAULT_OUTPUT, append: bool = True):
+    def save_to_geojson(self, data: List[Dict], output_path: str = DEFAULT_OUTPUT_PREFIX, append: bool = True):
         """
         Save extracted data to a GeoJSON file.
 
@@ -538,15 +551,47 @@ class WazeAPIDataScraper:
         feature_collection = geojson.FeatureCollection(features)
         
         # Check if file exists and append mode is on
-        if output_path.exists() and append:
+        if Path(output_path).exists() and append:
             try:
                 with open(output_path, "r") as f:
                     existing_data = geojson.loads(f.read())
                 
-                # Combine existing features with new features
-                all_features = existing_data["features"] + feature_collection["features"]
-                feature_collection = geojson.FeatureCollection(all_features)
-                logger.info(f"Appended to existing file: {output_path}")
+                if self.collate and "features" in existing_data:
+                    # Create dictionary to store unique features by id
+                    unique_features = {}
+                    
+                    # Add existing features to dictionary
+                    existing_count = 0
+                    for feature in existing_data["features"]:
+                        if "properties" in feature and "id" in feature["properties"]:
+                            unique_features[feature["properties"]["id"]] = feature
+                            existing_count += 1
+                    
+                    # Track how many new unique features are added
+                    new_unique_count = 0
+                    
+                    # Add new features, overwriting duplicates
+                    for feature in feature_collection["features"]:
+                        if "properties" in feature and "id" in feature["properties"]:
+                            feature_id = feature["properties"]["id"]
+                            if feature_id not in unique_features:
+                                new_unique_count += 1
+                            unique_features[feature_id] = feature
+                    
+                    # Convert back to list
+                    all_features = list(unique_features.values())
+                    feature_collection = geojson.FeatureCollection(all_features)
+                    
+                    # Only log if we actually added new data
+                    if new_unique_count > 0:
+                        logger.info(f"Collated data with {new_unique_count} new unique alerts, total: {len(all_features)}")
+                    else:
+                        logger.info(f"No new unique alerts found. Total alerts: {len(all_features)}")
+                else:
+                    # Regular append without deduplication
+                    all_features = existing_data["features"] + feature_collection["features"]
+                    feature_collection = geojson.FeatureCollection(all_features)
+                    logger.info(f"Appended to existing file: {output_path}")
             except Exception as e:
                 logger.error(f"Error when appending to existing file: {str(e)}")
         
@@ -578,12 +623,31 @@ class WazeAPIDataScraper:
         df = pd.DataFrame(data)
         
         # Check if file exists and append mode is on
-        if output_path.exists() and append:
+        if Path(output_path).exists() and append:
             try:
                 existing_df = pd.read_csv(output_path)
-                # Combine with new data
-                df = pd.concat([existing_df, df], ignore_index=True)
-                logger.info(f"Appended to existing file: {output_path}")
+                
+                if self.collate and "id" in existing_df.columns and "id" in df.columns:
+                    # Get set of existing IDs
+                    existing_ids = set(existing_df["id"].values)
+                    
+                    # Count new unique alerts
+                    new_ids = set(df["id"].values)
+                    new_unique_count = len(new_ids - existing_ids)
+                    
+                    # Concatenate and drop duplicates, keeping the latest occurrence
+                    combined_df = pd.concat([existing_df, df], ignore_index=True)
+                    df = combined_df.drop_duplicates(subset=["id"], keep="last")
+                    
+                    # Only log if we actually added new data
+                    if new_unique_count > 0:
+                        logger.info(f"Collated data with {new_unique_count} new unique alerts, total: {len(df)}")
+                    else:
+                        logger.info(f"No new unique alerts found. Total alerts: {len(df)}")
+                else:
+                    # Regular append without deduplication
+                    df = pd.concat([existing_df, df], ignore_index=True)
+                    logger.info(f"Appended to existing file: {output_path}")
             except Exception as e:
                 logger.error(f"Error when appending to existing file: {str(e)}")
         
@@ -609,15 +673,45 @@ class WazeAPIDataScraper:
         output_path = self._add_timestamp_to_path(output_path)
         
         # Check if file exists and append mode is on
-        if output_path.exists() and append:
+        if Path(output_path).exists() and append:
             try:
                 with open(output_path, "r") as f:
                     existing_data = json.load(f)
                 
-                # Combine existing data with new data
-                if isinstance(existing_data, list):
+                if self.collate and isinstance(existing_data, list):
+                    # Create dictionary for fast lookup by ID
+                    unique_alerts = {}
+                    
+                    # Add existing alerts to dictionary and track count
+                    existing_count = 0
+                    for alert in existing_data:
+                        if "id" in alert:
+                            unique_alerts[alert["id"]] = alert
+                            existing_count += 1
+                    
+                    # Track how many new unique alerts are added
+                    new_unique_count = 0
+                    
+                    # Add new alerts, overwriting duplicates
+                    for alert in data:
+                        if "id" in alert:
+                            # Check if this is a new alert
+                            if alert["id"] not in unique_alerts:
+                                new_unique_count += 1
+                            unique_alerts[alert["id"]] = alert
+                    
+                    # Convert back to list
+                    data = list(unique_alerts.values())
+                    
+                    # Only log if we actually added new data
+                    if new_unique_count > 0:
+                        logger.info(f"Collated data with {new_unique_count} new unique alerts, total: {len(data)}")
+                    else:
+                        logger.info(f"No new unique alerts found. Total alerts: {len(data)}")
+                elif isinstance(existing_data, list):
+                    # Regular append without deduplication
                     data = existing_data + data
-                logger.info(f"Appended to existing file: {output_path}")
+                    logger.info(f"Appended to existing file: {output_path}")
             except Exception as e:
                 logger.error(f"Error when appending to existing file: {str(e)}")
         
@@ -626,6 +720,33 @@ class WazeAPIDataScraper:
             json.dump(data, f, indent=2)
             
         logger.success(f"Saved {len(data)} records to {output_path}")
+
+    def _get_default_output_path(self, format_type: str) -> str:
+        """
+        Generate a default output path based on format and alert types.
+        
+        Args:
+            format_type: The output format (json, geojson, csv)
+            
+        Returns:
+            Path string for the output file
+        """
+        timestamp = int(time.time())
+        # Create filename with alert types
+        alert_str = "_".join(self.alert_types).lower()
+        
+        # If in full mode, add _full suffix
+        full_suffix = "_full" if self.full_mode else ""
+        
+        # Determine file extension
+        extension = f".{format_type}" if format_type != "geojson" else ".geojson"
+        
+        if self.collate:
+            # For collate mode use simplified filename
+            return f"{DEFAULT_OUTPUT_PREFIX}{extension}"
+        else:
+            # For non-collate mode, include alert types and timestamp
+            return f"{alert_str}{full_suffix}_{timestamp}{extension}"
 
 
 def parse_runtime(runtime_str: str) -> int:
@@ -657,19 +778,67 @@ def parse_runtime(runtime_str: str) -> int:
     return total_seconds
 
 
+def version_callback(value: bool):
+    """Display version information and exit."""
+    if value:
+        # ANSI color codes
+        BRIGHT_RED = "\033[91;1m"
+        BRIGHT_GREEN = "\033[92;1m"
+        BRIGHT_YELLOW = "\033[93;1m"
+        BRIGHT_BLUE = "\033[94;1m"
+        BRIGHT_MAGENTA = "\033[95;1m"
+        BRIGHT_CYAN = "\033[96;1m"
+        RAINBOW_COLORS = [BRIGHT_RED, BRIGHT_YELLOW, BRIGHT_GREEN, BRIGHT_CYAN, BRIGHT_BLUE, BRIGHT_MAGENTA]
+        BLINK = "\033[5m"
+        BOLD = "\033[1m"
+        UNDERLINE = "\033[4m"
+        RESET = "\033[0m"
+        BACKGROUND_RED = "\033[41m"
+        BACKGROUND_GREEN = "\033[42m"
+
+        # Obnoxious version display
+        typer.echo("\n" + "=" * 60)
+        typer.echo(f"{BLINK}{BACKGROUND_RED}{BRIGHT_YELLOW}🚨 🚨 🚨 SUPER AWESOME WAZE POLICE SCRAPER 🚨 🚨 🚨{RESET}")
+        
+        # Rainbow version number
+        version_str = f"v{VERSION}"
+        rainbow_version = ""
+        for i, char in enumerate(version_str):
+            color = RAINBOW_COLORS[i % len(RAINBOW_COLORS)]
+            rainbow_version += f"{color}{char}{RESET}"
+        
+        typer.echo(f"\n{BOLD}🔥🔥🔥 {BACKGROUND_GREEN}{BRIGHT_MAGENTA} VERSION {rainbow_version} {RESET} 🔥🔥🔥")
+        
+        # Author info
+        typer.echo(f"\n{BRIGHT_CYAN}💯 CREATED WITH {BRIGHT_RED}❤️  BY THE {BRIGHT_YELLOW}AMAZING{RESET} {UNDERLINE}{BOLD}{BRIGHT_GREEN}{AUTHOR}{RESET}")
+        
+        # GitHub link with emojis
+        typer.echo(f"\n{BRIGHT_BLUE}🌟 {BLINK}STAR ME{RESET} {BRIGHT_BLUE}ON GITHUB!!!{RESET} 👇👇👇")
+        typer.echo(f"{UNDERLINE}{BRIGHT_CYAN}{GITHUB}{RESET}")
+        
+        # Footer with more emojis
+        typer.echo(f"\n{BRIGHT_YELLOW}💪 💪 POWERED BY PYTHON MAGIC 🐍 ✨ AND {RESET}my genius.{BRIGHT_YELLOW} ☕ 🔋{RESET}")
+        typer.echo(f"{BRIGHT_MAGENTA}👮 CATCHING BAD GUYS ONE API CALL AT A TIME 👮{RESET}")
+        typer.echo("=" * 60 + "\n")
+        
+        raise typer.Exit()
+
+
 def run(
     bounds: str = typer.Option(
         f"{DEFAULT_BOUNDS[0]},{DEFAULT_BOUNDS[1]},{DEFAULT_BOUNDS[2]},{DEFAULT_BOUNDS[3]}",
         help="Bounding box as lat1,lon1,lat2,lon2",
     ),
-    output: str = typer.Option(DEFAULT_OUTPUT, help="Output file path (JSON, GeoJSON, or CSV)"),
+    format: str = typer.Option("json", "--format", "-f", help="Output format: 'json', 'geojson', or 'csv'"),
     interval: int = typer.Option(DEFAULT_INTERVAL, help="Polling interval in seconds (0 for one-time)"),
-    format: str = typer.Option("json", "--format", "-f", help="Force output format: 'json', 'geojson', or 'csv'"),
     schema_path: str = typer.Option(None, "--schema", help="Path to JSON schema file (default: wazedata.json in schema dir)"),
     raw_output: str = typer.Option(None, "--raw", help="Save raw schema-validated data to this file"),
     runtime: str = typer.Option(None, "--runtime", help="Maximum runtime in format '99d 99h 99m 99s'"),
     filter: str = typer.Option("POLICE", "--filter", help="Comma-separated list of alert types to extract (e.g., 'POLICE,ACCIDENT,HAZARD')"),
     full: bool = typer.Option(False, "--full", help="Preserve all alert properties instead of extracting specific fields"),
+    collate: Optional[str] = typer.Option(None, "--collate", help="Maintain a single output file with deduplicated alerts. Optional filepath can be provided"),
+    force: bool = typer.Option(False, "--force", help="Force overwrite/append to existing collate files"),
+    version: Optional[bool] = typer.Option(None, "--version", callback=version_callback, is_eager=True, help="Show version information and exit"),
 ):
     """Run the Waze police data API scraper."""
     try:
@@ -692,8 +861,35 @@ def run(
         if full:
             logger.info("Running in full mode: preserving all alert properties")
             
+        # Handle collate parameter
+        collate_mode = False
+        collate_path = None
+        
+        if collate is not None:
+            collate_mode = True
+            # If collate was provided with a value, use it as output path
+            if collate:
+                collate_path = collate
+                logger.info(f"Running in collate mode with custom path: {collate_path}")
+                
+                # Infer format from the collate filename extension if provided
+                if "." in collate_path:
+                    inferred_ext = Path(collate_path).suffix.lower().lstrip(".")
+                    if inferred_ext in ["json", "csv", "geojson"]:
+                        if inferred_ext != format:
+                            logger.info(f"Format inferred from --collate filename: {inferred_ext} (overriding --format value)")
+                            format = inferred_ext
+            else:
+                logger.info("Running in collate mode with default path")
+            
         # Initialize scraper
-        scraper = WazeAPIDataScraper(bounds=bounds_tuple, schema_path=schema, alert_types=alert_types, full_mode=full)
+        scraper = WazeAPIDataScraper(
+            bounds=bounds_tuple, 
+            schema_path=schema, 
+            alert_types=alert_types, 
+            full_mode=full, 
+            collate=collate_mode
+        )
         
         # Parse runtime if provided
         max_runtime = None
@@ -701,25 +897,39 @@ def run(
             max_runtime = parse_runtime(runtime)
             logger.info(f"Maximum runtime set to {max_runtime} seconds")
         
-        # Determine output format based on file extension or format parameter
-        output_path = Path(output)
+        # Determine output format
+        format = format.lower()
+        if format not in ["json", "geojson", "csv"]:
+            logger.warning(f"Unknown format '{format}', defaulting to json")
+            format = "json"
         
-        if format:
-            # Use the specified format
-            format = format.lower()
-            if format not in ["json", "geojson", "csv"]:
-                logger.warning(f"Unknown format '{format}', defaulting to json")
-                format = "json"
-            output_format = format
+        # Set output path
+        if collate_path:
+            # Use provided collate path
+            output = collate_path
         else:
-            # Determine format from file extension
-            suffix = output_path.suffix.lower()
-            if suffix == ".geojson":
-                output_format = "geojson"
-            elif suffix == ".csv":
-                output_format = "csv"
-            else:
-                output_format = "json"  # Default to JSON for all other extensions
+            # Generate default path based on format and alert types
+            output = scraper._get_default_output_path(format)
+        
+        logger.info(f"Using output path: {output} with format: {format}")
+        
+        # Ensure output has correct extension
+        if format == "csv" and not output.endswith(".csv"):
+            output = output.rsplit(".", 1)[0] + ".csv" if "." in output else output + ".csv"
+        elif format == "geojson" and not output.endswith(".geojson"):
+            output = output.rsplit(".", 1)[0] + ".geojson" if "." in output else output + ".geojson"
+        elif format == "json" and not output.endswith(".json"):
+            output = output.rsplit(".", 1)[0] + ".json" if "." in output else output + ".json"
+        
+        # Check if file exists and error if it's not empty in collate mode (unless --force is specified)
+        if collate_mode:
+            output_file = Path(output)
+            if output_file.exists() and output_file.stat().st_size > 0:
+                if force:
+                    logger.warning(f"Collate file '{output}' already exists and is not empty. --force specified, continuing anyway.")
+                else:
+                    logger.error(f"Collate file '{output}' already exists and is not empty. Use --force to append to it anyway.")
+                    raise typer.Exit(code=1)
         
         # Create a long-lived client for multiple requests
         with httpx.Client(timeout=30, follow_redirects=True) as client:
@@ -737,9 +947,9 @@ def run(
                             data = scraper.extract_police_data()
                             
                             # Save based on the determined format
-                            if output_format == "geojson":
+                            if format == "geojson":
                                 scraper.save_to_geojson(data, output)
-                            elif output_format == "csv":
+                            elif format == "csv":
                                 scraper.save_to_csv(data, output)
                             else:
                                 # Default to JSON
@@ -774,9 +984,9 @@ def run(
                 data = scraper.extract_police_data()
                 
                 # Save based on the determined format
-                if output_format == "geojson":
+                if format == "geojson":
                     scraper.save_to_geojson(data, output)
-                elif output_format == "csv":
+                elif format == "csv":
                     scraper.save_to_csv(data, output)
                 else:
                     # Default to JSON
