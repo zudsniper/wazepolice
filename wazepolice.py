@@ -34,7 +34,7 @@ import typer
 from loguru import logger
 
 # Version and author information
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 AUTHOR = "@zudsniper"
 GITHUB = "https://github.com/zudsniper/wazepolice"
 
