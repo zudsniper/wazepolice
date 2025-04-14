@@ -1,4 +1,3 @@
-playwright
 pandas
 python-dotenv
 loguru
