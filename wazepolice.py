@@ -34,7 +34,7 @@ import typer
 from loguru import logger
 
 # Version and author information
-VERSION = "2.1.1"
+VERSION = "2.1.3"
 AUTHOR = "@zudsniper"
 GITHUB = "https://github.com/zudsniper/wazepolice"
 
@@ -144,11 +144,27 @@ class SessionStats:
             timestamp = int(time.time())
             path = f"session_{timestamp}.json"
         
-        with open(path, 'w') as f:
-            json.dump(self.to_dict(), f, indent=2)
-        
-        logger.success(f"Session statistics saved to {path}")
-        return path
+        try:
+            # Create parent directories if they don't exist
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(path, 'w') as f:
+                json.dump(self.to_dict(), f, indent=2)
+            
+            logger.success(f"Session statistics saved to {path}")
+            return path
+        except (PermissionError, OSError) as e:
+            # Try to save in current directory if permission denied
+            filename = Path(path).name
+            logger.warning(f"Could not save to {path}, trying current directory with {filename}")
+            try:
+                with open(filename, 'w') as f:
+                    json.dump(self.to_dict(), f, indent=2)
+                logger.success(f"Session statistics saved to {filename}")
+                return filename
+            except Exception as inner_e:
+                logger.error(f"Failed to save session statistics: {str(inner_e)}")
+                return None
 
 class WazeAPIDataScraper:
     """Extracts police report coordinates from Waze by using internal API endpoints."""
@@ -623,9 +639,10 @@ class WazeAPIDataScraper:
             
         # Skip adding timestamp if collate mode is enabled
         if self.collate:
-            return path.with_name(f"{stem}{path.suffix}")
+            return path
         
-        return path.with_name(f"{stem}_{timestamp}{path.suffix}")
+        # Return with timestamp added to filename part only
+        return Path(path.parent) / f"{stem}_{timestamp}{path.suffix}"
 
     def _check_filesize_limit(self, additional_bytes: int, output_path: str) -> bool:
         """
@@ -1184,13 +1201,16 @@ def run(
     filter: str = typer.Option("POLICE", "--filter", help="Comma-separated list of alert types to extract (e.g., 'POLICE,ACCIDENT,HAZARD')"),
     full: bool = typer.Option(False, "--full", help="Preserve all alert properties instead of extracting specific fields"),
     collate: Optional[str] = typer.Option(None, "--collate", help="Maintain a single output file with deduplicated alerts. Optional filepath can be provided"),
-    force: bool = typer.Option(False, "--force", help="Force overwrite/append to existing collate files"),
+    force: bool = typer.Option(False, "--force", help="Force append to existing collate files"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing collate files instead of appending"),
     version: Optional[bool] = typer.Option(None, "--version", callback=version_callback, is_eager=True, help="Show version information and exit"),
     max_retries: int = typer.Option(5, "--max-retries", help="Maximum number of retry attempts for API calls"),
     max_filesize: str = typer.Option(None, "--max-filesize", help="Maximum total file size in bytes or with units (e.g., '10mb', '1gb')"),
 ):
     """Run the Waze police data API scraper."""
     stats_saved = False  # Track if session stats have been saved
+    scraper_initialized = False  # Track if scraper was successfully initialized
+    
     try:
         # Print version information
         logger.info(f"WazePolice Scraper v{VERSION} by {AUTHOR}")
@@ -1210,6 +1230,11 @@ def run(
         # Log full mode status
         if full:
             logger.info("Running in full mode: preserving all alert properties")
+            
+        # Check for conflicting flags
+        if force and overwrite:
+            logger.warning("Both --force and --overwrite specified. --overwrite takes precedence.")
+            force = False
             
         # Handle collate parameter
         collate_mode = False
@@ -1243,6 +1268,9 @@ def run(
             max_filesize=parse_filesize(max_filesize) if max_filesize else None
         )
         
+        # Mark scraper as successfully initialized
+        scraper_initialized = True
+        
         # Parse runtime if provided
         max_runtime = None
         if runtime:
@@ -1273,20 +1301,31 @@ def run(
         elif format == "json" and not output.endswith(".json"):
             output = output.rsplit(".", 1)[0] + ".json" if "." in output else output + ".json"
         
-        # Check if file exists and error if it's not empty in collate mode (unless --force is specified)
+        # Check if file exists and error if it's not empty in collate mode
         if collate_mode:
             output_file = Path(output)
             if output_file.exists() and output_file.stat().st_size > 0:
-                if force:
-                    logger.warning(f"Collate file '{output}' already exists and is not empty. --force specified, continuing anyway.")
+                if overwrite:
+                    logger.warning(f"Collate file '{output}' already exists and is not empty. --overwrite specified, will overwrite the file.")
+                elif force:
+                    logger.warning(f"Collate file '{output}' already exists and is not empty. --force specified, will append to the file.")
                 else:
-                    logger.error(f"Collate file '{output}' already exists and is not empty. Use --force to append to it anyway.")
+                    logger.error(f"Collate file '{output}' already exists and is not empty. Use --force to append or --overwrite to replace it.")
+                    raise typer.Exit(code=1)
+                    
+            # If overwrite is specified, remove the existing file
+            if overwrite and output_file.exists():
+                try:
+                    output_file.unlink()
+                    logger.info(f"Removed existing file: {output}")
+                except Exception as e:
+                    logger.error(f"Failed to remove existing file: {str(e)}")
                     raise typer.Exit(code=1)
         
         # Function to save session stats at exit
         def save_session_stats():
             nonlocal stats_saved
-            if collate_mode and not stats_saved:
+            if collate_mode and not stats_saved and scraper_initialized and scraper.session_stats.api_calls > 0:
                 timestamp = int(time.time())
                 stats_file = f"session_{timestamp}.json"
                 scraper.session_stats.save(stats_file)
@@ -1388,9 +1427,13 @@ def run(
             
     except Exception as e:
         logger.error(f"Error: {str(e)}")
-        # Try to save session stats if possible
-        if 'scraper' in locals() and hasattr(scraper, 'session_stats') and collate_mode and not stats_saved:
-            scraper.session_stats.save(f"session_error_{int(time.time())}.json")
+        # Try to save session stats if possible, but only if the scraper was initialized
+        # and performed at least one API call
+        if 'scraper' in locals() and scraper_initialized and hasattr(scraper, 'session_stats') and \
+           collate_mode and not stats_saved and scraper.session_stats.api_calls > 0:
+            timestamp = int(time.time())
+            stats_file = f"session_error_{timestamp}.json"
+            scraper.session_stats.save(stats_file)
             stats_saved = True
         raise typer.Exit(code=1)
 
