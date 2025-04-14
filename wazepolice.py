@@ -7,10 +7,10 @@ the internal API endpoints used by the Waze live map.
 
 Usage:
     python wazepolice.py --bounds lat1,lon1,lat2,lon2
-    python wazepolice.py --output police_data.json
     python wazepolice.py --interval 300
     python wazepolice.py --runtime "1d 2h 30m 15s"
     python wazepolice.py --filter "POLICE,ACCIDENT,HAZARD"
+    python wazepolice.py --full
 """
 
 import json
@@ -28,7 +28,7 @@ import typer
 from loguru import logger
 
 # Version and author information
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 AUTHOR = "@zudsniper"
 
 # Default coordinates (can be modified via command-line args)
@@ -45,7 +45,8 @@ class WazeAPIDataScraper:
         self,
         bounds: Tuple[float, float, float, float] = DEFAULT_BOUNDS,
         schema_path: str = Path(__file__).parent / "schema" / "wazedata.json",
-        alert_types: List[str] = DEFAULT_ALERT_TYPES
+        alert_types: List[str] = DEFAULT_ALERT_TYPES,
+        full_mode: bool = False
     ):
         """
         Initialize the scraper.
@@ -54,9 +55,11 @@ class WazeAPIDataScraper:
             bounds: Tuple of (lat1, lon1, lat2, lon2) defining the bounding box.
             schema_path: Path to the JSON schema file.
             alert_types: List of alert types to extract.
+            full_mode: Whether to preserve all alert properties.
         """
         self.bounds = bounds
         self.alert_types = [alert_type.upper() for alert_type in alert_types]
+        self.full_mode = full_mode
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -79,7 +82,7 @@ class WazeAPIDataScraper:
         except Exception as e:
             logger.warning(f"Unable to load schema file: {str(e)}")
             
-        logger.info(f"Initialized API scraper with bounds: {bounds}, alert types: {self.alert_types}")
+        logger.info(f"Initialized API scraper with bounds: {bounds}, alert types: {self.alert_types}, full mode: {self.full_mode}")
 
     def validate_data(self, data: Dict) -> bool:
         """
@@ -230,35 +233,54 @@ class WazeAPIDataScraper:
             try:
                 # Check if alert type matches any of the requested types
                 if alert.get("type") in self.alert_types:
-                    # Ensure the alert has the required fields according to the schema
-                    if not "location" in alert:
-                        # Create a location object if missing
-                        if "y" in alert and "x" in alert:
-                            alert["location"] = {"x": alert["x"], "y": alert["y"]}
-                        else:
-                            logger.warning(f"Alert missing required location data: {alert}")
+                    # If in full mode, just add timestamp and keep all properties
+                    if self.full_mode:
+                        # Make a copy to avoid modifying the original
+                        result = dict(alert)
+                        result["timestamp"] = timestamp
+                        # Ensure we still have coordinates in a standard format
+                        if "location" in alert and "x" in alert["location"] and "y" in alert["location"]:
+                            result["lon"] = alert["location"]["x"]
+                            result["lat"] = alert["location"]["y"]
+                        elif "x" in alert and "y" in alert:
+                            result["lon"] = alert["x"]
+                            result["lat"] = alert["y"]
+                    else:
+                        # Standard mode - extract specific fields
+                        # Ensure the alert has the required fields according to the schema
+                        if not "location" in alert:
+                            # Create a location object if missing
+                            if "y" in alert and "x" in alert:
+                                alert["location"] = {"x": alert["x"], "y": alert["y"]}
+                            else:
+                                logger.warning(f"Alert missing required location data: {alert}")
+                                continue
+                                
+                        # Check for missing required fields
+                        if not "uuid" in alert:
+                            logger.warning(f"Alert missing required uuid field: {alert}")
                             continue
                             
-                    # Check for missing required fields
-                    if not "uuid" in alert:
-                        logger.warning(f"Alert missing required uuid field: {alert}")
-                        continue
+                        if not "pubMillis" in alert:
+                            alert["pubMillis"] = int(time.time() * 1000)
                         
-                    if not "pubMillis" in alert:
-                        alert["pubMillis"] = int(time.time() * 1000)
+                        result = {
+                            "id": alert.get("uuid", ""),
+                            "type": alert.get("type", ""),
+                            "lat": alert.get("location", {}).get("y"),
+                            "lon": alert.get("location", {}).get("x"),
+                            "reported_by": alert.get("reportedBy", ""),
+                            "confidence": alert.get("confidence", 0),
+                            "reliability": alert.get("reliability", 0),
+                            "report_rating": alert.get("reportRating", 0),
+                            "timestamp": timestamp,
+                            "pub_millis": alert.get("pubMillis", 0),
+                        }
+                        
+                        # Add subtype if it exists
+                        if "subtype" in alert:
+                            result["subtype"] = alert["subtype"]
                     
-                    result = {
-                        "id": alert.get("uuid", ""),
-                        "type": alert.get("type", ""),
-                        "lat": alert.get("location", {}).get("y"),
-                        "lon": alert.get("location", {}).get("x"),
-                        "reported_by": alert.get("reportedBy", ""),
-                        "confidence": alert.get("confidence", 0),
-                        "reliability": alert.get("reliability", 0),
-                        "report_rating": alert.get("reportRating", 0),
-                        "timestamp": timestamp,
-                        "pub_millis": alert.get("pubMillis", 0),
-                    }
                     results.append(result)
             except Exception as e:
                 logger.error(f"Error processing alert: {str(e)}")
@@ -295,26 +317,41 @@ class WazeAPIDataScraper:
                         lon = alert.get("x")
                         
                     if lat and lon:
-                        # Ensure required fields are present according to schema
-                        if not "uuid" in alert:
-                            logger.warning(f"Alert missing required uuid field")
-                            continue
+                        # If in full mode, just add timestamp and keep all properties
+                        if self.full_mode:
+                            # Make a copy to avoid modifying the original
+                            result = dict(alert)
+                            result["timestamp"] = timestamp
+                            # Ensure we have standardized coordinates
+                            result["lon"] = lon
+                            result["lat"] = lat
+                        else:
+                            # Standard mode - extract specific fields
+                            # Ensure required fields are present according to schema
+                            if not "uuid" in alert:
+                                logger.warning(f"Alert missing required uuid field")
+                                continue
+                                
+                            if not "pubMillis" in alert:
+                                alert["pubMillis"] = int(time.time() * 1000)
+                                
+                            result = {
+                                "id": alert.get("uuid", ""),
+                                "type": alert_type,
+                                "lat": lat,
+                                "lon": lon,
+                                "reported_by": alert.get("reportedBy", ""),
+                                "confidence": alert.get("confidence", 0),
+                                "reliability": alert.get("reliability", 0),
+                                "report_rating": alert.get("reportRating", 0),
+                                "timestamp": timestamp,
+                                "pub_millis": alert.get("pubMillis", 0),
+                            }
                             
-                        if not "pubMillis" in alert:
-                            alert["pubMillis"] = int(time.time() * 1000)
-                            
-                        result = {
-                            "id": alert.get("uuid", ""),
-                            "type": alert_type,
-                            "lat": lat,
-                            "lon": lon,
-                            "reported_by": alert.get("reportedBy", ""),
-                            "confidence": alert.get("confidence", 0),
-                            "reliability": alert.get("reliability", 0),
-                            "report_rating": alert.get("reportRating", 0),
-                            "timestamp": timestamp,
-                            "pub_millis": alert.get("pubMillis", 0),
-                        }
+                            # Add subtype if it exists
+                            if "subtype" in alert:
+                                result["subtype"] = alert["subtype"]
+                        
                         results.append(result)
             except Exception as e:
                 logger.error(f"Error processing alert: {str(e)}")
@@ -356,26 +393,42 @@ class WazeAPIDataScraper:
                         
                         for alert in alerts:
                             if alert.get("type") in self.alert_types:
-                                # Ensure required fields are present according to schema
-                                if not "uuid" in alert:
-                                    logger.warning(f"Alert missing required uuid field")
-                                    continue
+                                # If in full mode, just add timestamp and keep all properties
+                                if self.full_mode:
+                                    # Make a copy to avoid modifying the original
+                                    result = dict(alert)
+                                    result["timestamp"] = timestamp
+                                    # Ensure we have standardized coordinates if they exist
+                                    if "y" in alert and "x" in alert:
+                                        result["lon"] = alert["x"]
+                                        result["lat"] = alert["y"]
+                                else:
+                                    # Standard mode - extract specific fields
+                                    # Ensure required fields are present according to schema
+                                    if not "uuid" in alert:
+                                        logger.warning(f"Alert missing required uuid field")
+                                        continue
+                                        
+                                    if not "pubMillis" in alert:
+                                        alert["pubMillis"] = int(time.time() * 1000)
+                                        
+                                    result = {
+                                        "id": alert.get("uuid", ""),
+                                        "type": alert.get("type", ""),
+                                        "lat": alert.get("y"),
+                                        "lon": alert.get("x"),
+                                        "reported_by": alert.get("reportedBy", ""),
+                                        "confidence": alert.get("confidence", 0),
+                                        "reliability": alert.get("reliability", 0),
+                                        "report_rating": alert.get("reportRating", 0),
+                                        "timestamp": timestamp,
+                                        "pub_millis": alert.get("pubMillis", 0),
+                                    }
                                     
-                                if not "pubMillis" in alert:
-                                    alert["pubMillis"] = int(time.time() * 1000)
-                                    
-                                result = {
-                                    "id": alert.get("uuid", ""),
-                                    "type": alert.get("type", ""),
-                                    "lat": alert.get("y"),
-                                    "lon": alert.get("x"),
-                                    "reported_by": alert.get("reportedBy", ""),
-                                    "confidence": alert.get("confidence", 0),
-                                    "reliability": alert.get("reliability", 0),
-                                    "report_rating": alert.get("reportRating", 0),
-                                    "timestamp": timestamp,
-                                    "pub_millis": alert.get("pubMillis", 0),
-                                }
+                                    # Add subtype if it exists
+                                    if "subtype" in alert:
+                                        result["subtype"] = alert["subtype"]
+                                
                                 results.append(result)
                         
                         logger.success(f"Fallback method extracted {len(results)} alerts")
@@ -419,7 +472,13 @@ class WazeAPIDataScraper:
         """
         path = Path(path_str)
         timestamp = int(time.time())
-        return path.with_name(f"{path.stem}_{timestamp}{path.suffix}")
+        stem = path.stem
+        
+        # Add _full suffix if in full mode
+        if self.full_mode and "_full" not in stem:
+            stem = f"{stem}_full"
+            
+        return path.with_name(f"{stem}_{timestamp}{path.suffix}")
 
     def save_to_geojson(self, data: List[Dict], output_path: str = DEFAULT_OUTPUT, append: bool = True):
         """
@@ -442,20 +501,36 @@ class WazeAPIDataScraper:
         for item in data:
             try:
                 # Create GeoJSON feature
-                feature = geojson.Feature(
-                    geometry=geojson.Point((item["lon"], item["lat"])),
-                    properties={
-                        "id": item["id"],
-                        "type": item["type"],
-                        "reported_by": item["reported_by"],
-                        "confidence": item["confidence"],
-                        "reliability": item["reliability"],
-                        "report_rating": item["report_rating"],
-                        "timestamp": item["timestamp"],
-                        "pub_millis": item["pub_millis"],
-                    }
-                )
-                features.append(feature)
+                if "lon" in item and "lat" in item:
+                    feature_properties = {}
+                    
+                    # If in full mode, use all properties except lat/lon (used for geometry)
+                    if self.full_mode:
+                        for key, value in item.items():
+                            if key not in ["lon", "lat"]:
+                                feature_properties[key] = value
+                    else:
+                        # Standard mode - extract specific fields
+                        feature_properties = {
+                            "id": item.get("id", ""),
+                            "type": item.get("type", ""),
+                            "reported_by": item.get("reported_by", ""),
+                            "confidence": item.get("confidence", 0),
+                            "reliability": item.get("reliability", 0),
+                            "report_rating": item.get("report_rating", 0),
+                            "timestamp": item.get("timestamp", ""),
+                            "pub_millis": item.get("pub_millis", 0),
+                        }
+                        
+                        # Add subtype if it exists
+                        if "subtype" in item:
+                            feature_properties["subtype"] = item["subtype"]
+                    
+                    feature = geojson.Feature(
+                        geometry=geojson.Point((item["lon"], item["lat"])),
+                        properties=feature_properties
+                    )
+                    features.append(feature)
             except Exception as e:
                 logger.error(f"Error creating GeoJSON feature: {str(e)}")
         
@@ -494,6 +569,8 @@ class WazeAPIDataScraper:
             logger.warning("No data to save")
             return
             
+        if not output_path.endswith(".csv"):
+            output_path = output_path.rsplit(".", 1)[0] + ".csv" if "." in output_path else output_path + ".csv"
         # Add Unix epoch timestamp to filename
         output_path = self._add_timestamp_to_path(output_path)
         
@@ -592,6 +669,7 @@ def run(
     raw_output: str = typer.Option(None, "--raw", help="Save raw schema-validated data to this file"),
     runtime: str = typer.Option(None, "--runtime", help="Maximum runtime in format '99d 99h 99m 99s'"),
     filter: str = typer.Option("POLICE", "--filter", help="Comma-separated list of alert types to extract (e.g., 'POLICE,ACCIDENT,HAZARD')"),
+    full: bool = typer.Option(False, "--full", help="Preserve all alert properties instead of extracting specific fields"),
 ):
     """Run the Waze police data API scraper."""
     try:
@@ -609,9 +687,13 @@ def run(
         # Parse alert types
         alert_types = [alert_type.strip().upper() for alert_type in filter.split(",")]
         logger.info(f"Filtering for alert types: {alert_types}")
+        
+        # Log full mode status
+        if full:
+            logger.info("Running in full mode: preserving all alert properties")
             
         # Initialize scraper
-        scraper = WazeAPIDataScraper(bounds=bounds_tuple, schema_path=schema, alert_types=alert_types)
+        scraper = WazeAPIDataScraper(bounds=bounds_tuple, schema_path=schema, alert_types=alert_types, full_mode=full)
         
         # Parse runtime if provided
         max_runtime = None

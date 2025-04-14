@@ -2,7 +2,7 @@
 
 A Python tool for extracting police reports and other alert types from Waze by directly accessing the internal API endpoints used by the Waze live map.
 
-Version: 1.0.2  
+Version: 1.1.0  
 Author: github - @zudsniper
 
 ## Features
@@ -14,6 +14,7 @@ Author: github - @zudsniper
 - Time-limited operation with "99d 99h 99m 99s" format
 - Custom alert type filtering
 - Timestamps added to output files automatically
+- Full property preservation mode (--full flag)
 
 ## Installation
 
@@ -72,6 +73,9 @@ python wazepolice.py --runtime "1d 2h 30m 15s"
 # Filter for multiple alert types (default is POLICE only)
 python wazepolice.py --filter "POLICE,ACCIDENT,HAZARD"
 
+# Preserve all alert properties (full mode)
+python wazepolice.py --full
+
 # Specify output format (json, geojson, or csv)
 python wazepolice.py --format geojson
 
@@ -94,6 +98,7 @@ python wazepolice.py --schema my_schema.json
 | `--raw` | Save raw schema-validated data to this file | None |
 | `--runtime` | Maximum runtime in format '99d 99h 99m 99s' | None |
 | `--filter` | Comma-separated list of alert types to extract | POLICE |
+| `--full` | Preserve all alert properties instead of specific fields | False |
 | `--help` | Show help information | |
 
 ## Output Format
@@ -102,11 +107,13 @@ The scraper can output data in three formats:
 
 ### JSON (default)
 
+Standard mode extracts specific fields:
 ```json
 [
   {
     "id": "abc123",
     "type": "POLICE",
+    "subtype": "VISIBLE",
     "lat": 34.0522,
     "lon": -118.2437,
     "reported_by": "userXYZ",
@@ -117,6 +124,11 @@ The scraper can output data in three formats:
     "pub_millis": 1680353696789
   }
 ]
+```
+
+In full mode (--full), all properties from the Waze API are preserved, and the filename includes "_full":
+```
+police_full_1680353696.json
 ```
 
 ### GeoJSON
@@ -134,7 +146,29 @@ Output files are automatically appended with a Unix epoch timestamp:
 police_1680353696.json
 ```
 
+When using full mode (--full), "_full" is added to the filename:
+```
+police_full_1680353696.json
+```
+
+## Alert Types
+
+Common alert types you can use with `--filter`:
+
+- `POLICE` - Police reports
+- `ACCIDENT` - Accident reports
+- `HAZARD` - Road hazards
+- `JAM` - Traffic jams
+- `ROAD_CLOSED` - Road closures
+- `CONSTRUCTION` - Construction areas
+
 ## Examples
+
+### Extract all alert types with all properties
+
+```bash
+python wazepolice.py --filter "POLICE,ACCIDENT,HAZARD,JAM,ROAD_CLOSED,CONSTRUCTION" --full
+```
 
 ### Monitor a specific area for police reports for 24 hours
 
