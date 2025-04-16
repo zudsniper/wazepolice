@@ -7,3 +7,9 @@ police_*
 session_*
 test_collate*
 output**
+# cursor-tools
+.repomix*
+!.repomixignore
+cursor-tools.config.json
+
+.cursor

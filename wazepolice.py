@@ -14,6 +14,9 @@ Usage:
     python wazepolice.py --collate
     python wazepolice.py --collate custom_output.json
     python wazepolice.py --collate existing_file.json --force
+    python wazepolice.py --new
+    python wazepolice.py --resume session_1234567890.json
+    python wazepolice.py --checkpoint 60
     python wazepolice.py --version
 """
 
@@ -23,6 +26,10 @@ import httpx
 import re
 import random
 import statistics
+import signal
+import sys
+import os
+import glob
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -34,7 +41,7 @@ import typer
 from loguru import logger
 
 # Version and author information
-VERSION = "2.1.3"
+VERSION = "3.0.0"
 AUTHOR = "@zudsniper"
 GITHUB = "https://github.com/zudsniper/wazepolice"
 
@@ -42,9 +49,30 @@ GITHUB = "https://github.com/zudsniper/wazepolice"
 DEFAULT_BOUNDS = (33.7490, -84.3880, 36.1627, -86.7816)  # Atlanta to Nashville
 DEFAULT_INTERVAL = 600  # 10 minutes
 DEFAULT_ALERT_TYPES = ["POLICE"]  # Default alert types to filter
+DEFAULT_CHECKPOINT_INTERVAL = 300  # 5 minutes
 
 # Define default output names
 DEFAULT_OUTPUT_PREFIX = "all"
+
+# Global flag to track graceful shutdown
+GRACEFUL_SHUTDOWN = False
+
+def find_latest_checkpoint() -> Optional[str]:
+    """
+    Find the most recent checkpoint file in the current directory.
+    
+    Returns:
+        Path to the latest checkpoint file, or None if no checkpoint files found
+    """
+    # Look for both regular checkpoints and error checkpoints
+    checkpoint_files = glob.glob("session_checkpoint_*.json") + glob.glob("session_error_*.json")
+    
+    if not checkpoint_files:
+        return None
+        
+    # Get the latest checkpoint file based on timestamp in the filename
+    latest_file = max(checkpoint_files, key=lambda f: int(re.search(r'_(\d+)\.json$', f).group(1)))
+    return latest_file
 
 class SessionStats:
     """Track statistics for a scraping session."""
@@ -63,6 +91,12 @@ class SessionStats:
         self.total_alerts_found = 0
         self.backoff_incidents = 0
         self.actual_intervals = []
+        # For resuming sessions
+        self.last_call_time = None
+        self.elapsed_time = 0
+        self.remaining_runtime = None
+        self.last_known_alerts = set()
+        self.checkpoint_time = None
     
     def add_api_call(self, success: bool, response_time: float, data_size: int = 0):
         """Record an API call."""
@@ -90,6 +124,13 @@ class SessionStats:
         """Record actual interval between API calls."""
         self.actual_intervals.append(interval)
     
+    def update_checkpoint(self, current_time: float, alerts: List[Dict], remaining_runtime: Optional[float] = None):
+        """Update checkpoint information for potential resuming."""
+        self.last_call_time = current_time
+        self.checkpoint_time = datetime.now()
+        self.last_known_alerts = {alert.get('id') for alert in alerts if 'id' in alert}
+        self.remaining_runtime = remaining_runtime
+        
     def to_dict(self) -> Dict:
         """Convert statistics to a dictionary."""
         end_time = datetime.now()
@@ -107,7 +148,7 @@ class SessionStats:
         median_new_alerts = statistics.median(self.new_alerts_per_call) if len(self.new_alerts_per_call) > 1 else avg_new_alerts
         median_interval = statistics.median(self.actual_intervals) if len(self.actual_intervals) > 1 else avg_interval
         
-        return {
+        session_data = {
             "session_info": {
                 "start_time": self.start_time.isoformat(),
                 "end_time": end_time.isoformat(),
@@ -137,12 +178,25 @@ class SessionStats:
                 "median_new_alerts_per_call": median_new_alerts
             }
         }
+        
+        # Add resumable data if we have checkpoint information
+        if self.checkpoint_time:
+            session_data["resumable_data"] = {
+                "checkpoint_time": self.checkpoint_time.isoformat(),
+                "last_call_time": self.last_call_time,
+                "last_known_alerts": list(self.last_known_alerts),
+                "remaining_runtime": self.remaining_runtime,
+                "is_resumable": True
+            }
+        
+        return session_data
     
-    def save(self, path: Optional[str] = None):
+    def save(self, path: Optional[str] = None, is_checkpoint: bool = False, is_error: bool = False):
         """Save session statistics to a JSON file."""
         if path is None:
             timestamp = int(time.time())
-            path = f"session_{timestamp}.json"
+            prefix = "session_error_" if is_error else "session_checkpoint_" if is_checkpoint else "session_"
+            path = f"{prefix}{timestamp}.json"
         
         try:
             # Create parent directories if they don't exist
@@ -151,7 +205,7 @@ class SessionStats:
             with open(path, 'w') as f:
                 json.dump(self.to_dict(), f, indent=2)
             
-            logger.success(f"Session statistics saved to {path}")
+            logger.success(f"Session {'checkpoint' if is_checkpoint else 'statistics'} saved to {path}")
             return path
         except (PermissionError, OSError) as e:
             # Try to save in current directory if permission denied
@@ -160,11 +214,55 @@ class SessionStats:
             try:
                 with open(filename, 'w') as f:
                     json.dump(self.to_dict(), f, indent=2)
-                logger.success(f"Session statistics saved to {filename}")
+                logger.success(f"Session {'checkpoint' if is_checkpoint else 'statistics'} saved to {filename}")
                 return filename
             except Exception as inner_e:
                 logger.error(f"Failed to save session statistics: {str(inner_e)}")
                 return None
+
+    @classmethod
+    def load(cls, path: str) -> Optional['SessionStats']:
+        """Load session statistics from a JSON file."""
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+                
+            # Check if this is a resumable session file
+            if "resumable_data" not in data or not data["resumable_data"].get("is_resumable", False):
+                logger.error(f"Cannot resume from {path}: not a resumable session file")
+                return None
+                
+            # Create a new instance
+            bounds = tuple(data["session_info"]["bounds"])
+            alert_types = data["session_info"]["alert_types"]
+            stats = cls(bounds, alert_types)
+            
+            # Restore the session statistics
+            stats.api_calls = data["api_stats"]["total_calls"]
+            stats.api_failures = data["api_stats"]["failed_calls"]
+            stats.api_retries = data["api_stats"]["retries"]
+            stats.backoff_incidents = data["api_stats"]["backoff_incidents"]
+            stats.total_alerts_found = data["data_stats"]["total_alerts_found"]
+            
+            # Set resumable data
+            resumable = data["resumable_data"]
+            stats.checkpoint_time = datetime.fromisoformat(resumable["checkpoint_time"])
+            stats.last_call_time = resumable["last_call_time"]
+            stats.last_known_alerts = set(resumable["last_known_alerts"])
+            stats.remaining_runtime = resumable.get("remaining_runtime")
+            
+            # Calculate elapsed time based on original start time
+            original_start = datetime.fromisoformat(data["session_info"]["start_time"])
+            checkpoint = stats.checkpoint_time
+            stats.elapsed_time = (checkpoint - original_start).total_seconds()
+            
+            # Set the start time to now for the resumed session
+            stats.start_time = datetime.now()
+            
+            return stats
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Failed to load session from {path}: {str(e)}")
+            return None
 
 class WazeAPIDataScraper:
     """Extracts police report coordinates from Waze by using internal API endpoints."""
@@ -177,7 +275,9 @@ class WazeAPIDataScraper:
         full_mode: bool = False,
         collate: bool = False,
         max_retries: int = 5,
-        max_filesize: Optional[int] = None
+        max_filesize: Optional[int] = None,
+        checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
+        resume_from: Optional[str] = None
     ):
         """
         Initialize the scraper.
@@ -190,6 +290,8 @@ class WazeAPIDataScraper:
             collate: Whether to maintain a single file with deduplicated alerts.
             max_retries: Maximum number of retry attempts for API calls.
             max_filesize: Maximum file size in bytes (if set).
+            checkpoint_interval: How often to save checkpoint data (in seconds).
+            resume_from: Path to a session file to resume from.
         """
         self.bounds = bounds
         self.alert_types = [alert_type.upper() for alert_type in alert_types]
@@ -198,6 +300,9 @@ class WazeAPIDataScraper:
         self.max_retries = max_retries
         self.max_filesize = max_filesize
         self.current_filesize = 0
+        self.checkpoint_interval = checkpoint_interval
+        self.last_checkpoint_time = time.time()
+        self.resuming_session = False
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -211,8 +316,21 @@ class WazeAPIDataScraper:
             "Connection": "keep-alive",
         }
         
-        # Session statistics tracking
-        self.session_stats = SessionStats(bounds, self.alert_types)
+        # Try to resume from session if provided
+        if resume_from:
+            self.session_stats = SessionStats.load(resume_from)
+            if self.session_stats:
+                logger.info(f"Resuming session from {resume_from}")
+                self.resuming_session = True
+                # Override bounds and alert_types if loaded from session
+                self.bounds = self.session_stats.bounds
+                self.alert_types = self.session_stats.alert_types
+            else:
+                logger.error(f"Failed to resume from {resume_from}, starting new session")
+                self.session_stats = SessionStats(bounds, self.alert_types)
+        else:
+            # Session statistics tracking
+            self.session_stats = SessionStats(bounds, self.alert_types)
         
         # Load JSON schema
         self.schema = None
@@ -224,7 +342,45 @@ class WazeAPIDataScraper:
             logger.warning(f"Unable to load schema file: {str(e)}")
             
         logger.info(f"Initialized API scraper with bounds: {bounds}, alert types: {self.alert_types}, full mode: {self.full_mode}, collate: {self.collate}, max retries: {self.max_retries}" + 
-                  (f", max filesize: {format_filesize(self.max_filesize)}" if self.max_filesize else ""))
+                  (f", max filesize: {format_filesize(self.max_filesize)}" if self.max_filesize else "") +
+                  (f", checkpoint interval: {self.checkpoint_interval} seconds" if self.checkpoint_interval > 0 else ""))
+
+    def check_and_save_checkpoint(self, data: List[Dict], start_time: float, max_runtime: Optional[float] = None) -> bool:
+        """
+        Check if it's time to save a checkpoint and do so if needed.
+        
+        Args:
+            data: Current alert data
+            start_time: When the session started
+            max_runtime: Maximum runtime in seconds (if set)
+            
+        Returns:
+            True if checkpoint was saved, False otherwise
+        """
+        current_time = time.time()
+        elapsed = current_time - start_time
+        
+        # Calculate remaining runtime if set
+        remaining = None
+        if max_runtime:
+            remaining = max(0, max_runtime - elapsed)
+        
+        # Check if enough time has passed since last checkpoint
+        if self.checkpoint_interval > 0 and (current_time - self.last_checkpoint_time) >= self.checkpoint_interval:
+            # Update checkpoint data
+            self.session_stats.update_checkpoint(current_time, data, remaining)
+            
+            # Save checkpoint
+            timestamp = int(current_time)
+            checkpoint_file = f"session_checkpoint_{timestamp}.json"
+            self.session_stats.save(checkpoint_file, is_checkpoint=True)
+            
+            # Update last checkpoint time
+            self.last_checkpoint_time = current_time
+            
+            return True
+            
+        return False
 
     def validate_data(self, data: Dict) -> bool:
         """
@@ -1206,19 +1362,88 @@ def run(
     version: Optional[bool] = typer.Option(None, "--version", callback=version_callback, is_eager=True, help="Show version information and exit"),
     max_retries: int = typer.Option(5, "--max-retries", help="Maximum number of retry attempts for API calls"),
     max_filesize: str = typer.Option(None, "--max-filesize", help="Maximum total file size in bytes or with units (e.g., '10mb', '1gb')"),
+    checkpoint: int = typer.Option(DEFAULT_CHECKPOINT_INTERVAL, "--checkpoint", help="Interval in seconds to save checkpoint data for potential resume (0 to disable)"),
+    resume: Optional[str] = typer.Option(None, "--resume", help="Resume scraping from a specific saved session file"),
+    new: bool = typer.Option(False, "--new", help="Force start a new session even if checkpoint files exist"),
 ):
     """Run the Waze police data API scraper."""
     stats_saved = False  # Track if session stats have been saved
     scraper_initialized = False  # Track if scraper was successfully initialized
     
+    def signal_handler(sig, frame):
+        """Handle interrupt signals gracefully."""
+        global GRACEFUL_SHUTDOWN
+        if GRACEFUL_SHUTDOWN:
+            logger.warning("Forced exit requested. Terminating immediately.")
+            sys.exit(1)
+        else:
+            logger.warning("Interrupt received. Saving checkpoint and exiting gracefully...")
+            GRACEFUL_SHUTDOWN = True
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     try:
         # Print version information
         logger.info(f"WazePolice Scraper v{VERSION} by {AUTHOR}")
         
-        # Parse bounds
-        bounds_tuple = tuple(map(float, bounds.split(",")))
-        if len(bounds_tuple) != 4:
-            raise ValueError("Bounds must be in format: lat1,lon1,lat2,lon2")
+        # Determine whether to resume or start fresh
+        if resume:
+            # Explicit resume from specified file takes highest priority
+            logger.info(f"Attempting to resume from explicitly specified file: {resume}")
+            checkpoint_file = resume
+        elif not new:
+            # If not forced to be new, look for the latest checkpoint file
+            latest_checkpoint = find_latest_checkpoint()
+            if latest_checkpoint:
+                logger.info(f"Found latest checkpoint file: {latest_checkpoint}")
+                checkpoint_file = latest_checkpoint
+            else:
+                logger.info("No checkpoint files found. Starting a new session.")
+                checkpoint_file = None
+        else:
+            # Forced to start a new session
+            logger.info("Starting a new session (forced by --new flag).")
+            checkpoint_file = None
+        
+        # If resuming from a checkpoint
+        if checkpoint_file:
+            # Load session stats first to validate and extract session parameters
+            session_stats = SessionStats.load(checkpoint_file)
+            if not session_stats:
+                logger.error("Cannot resume session from checkpoint file. Starting a new session.")
+                checkpoint_file = None
+            else:
+                # Override parameters with those from the session file
+                bounds = ",".join(str(x) for x in session_stats.bounds)
+                filter = ",".join(session_stats.alert_types)
+                logger.info(f"Resuming with bounds: {bounds}, alert types: {filter}")
+                
+                # Calculate new runtime if there was a remaining runtime
+                if session_stats.remaining_runtime is not None and runtime is None:
+                    runtime_seconds = session_stats.remaining_runtime
+                    # Convert to a string format for display purposes
+                    days, remainder = divmod(runtime_seconds, 86400)
+                    hours, remainder = divmod(remainder, 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    runtime_parts = []
+                    if days > 0:
+                        runtime_parts.append(f"{int(days)}d")
+                    if hours > 0:
+                        runtime_parts.append(f"{int(hours)}h")
+                    if minutes > 0:
+                        runtime_parts.append(f"{int(minutes)}m")
+                    if seconds > 0 or not runtime_parts:
+                        runtime_parts.append(f"{int(seconds)}s")
+                    runtime = " ".join(runtime_parts)
+                    logger.info(f"Resuming with remaining runtime: {runtime}")
+        
+        # If not resuming, parse bounds
+        if not checkpoint_file:
+            bounds_tuple = tuple(map(float, bounds.split(",")))
+            if len(bounds_tuple) != 4:
+                raise ValueError("Bounds must be in format: lat1,lon1,lat2,lon2")
             
         # Use provided schema path or default
         schema = schema_path if schema_path else Path(__file__).parent / "schema" / "wazedata.json"
@@ -1256,16 +1481,18 @@ def run(
                             format = inferred_ext
             else:
                 logger.info("Running in collate mode with default path")
-            
+        
         # Initialize scraper
         scraper = WazeAPIDataScraper(
-            bounds=bounds_tuple, 
+            bounds=tuple(map(float, bounds.split(","))), 
             schema_path=schema, 
             alert_types=alert_types, 
             full_mode=full, 
             collate=collate_mode,
             max_retries=max_retries,
-            max_filesize=parse_filesize(max_filesize) if max_filesize else None
+            max_filesize=parse_filesize(max_filesize) if max_filesize else None,
+            checkpoint_interval=checkpoint,
+            resume_from=checkpoint_file
         )
         
         # Mark scraper as successfully initialized
@@ -1325,7 +1552,7 @@ def run(
         # Function to save session stats at exit
         def save_session_stats():
             nonlocal stats_saved
-            if collate_mode and not stats_saved and scraper_initialized and scraper.session_stats.api_calls > 0:
+            if not stats_saved and scraper_initialized and scraper.session_stats.api_calls > 0:
                 timestamp = int(time.time())
                 stats_file = f"session_{timestamp}.json"
                 scraper.session_stats.save(stats_file)
@@ -1341,6 +1568,34 @@ def run(
                 
                 try:
                     while True:
+                        # Check for graceful shutdown signal
+                        if GRACEFUL_SHUTDOWN:
+                            logger.info("Performing graceful shutdown...")
+                            # Save checkpoint for resuming later
+                            data = []  # Empty placeholder if we don't have actual data yet
+                            if hasattr(scraper, 'last_data') and scraper.last_data:
+                                data = scraper.last_data
+                            
+                            current_time = time.time()
+                            elapsed = current_time - start_time
+                            
+                            # Calculate remaining runtime
+                            remaining = None
+                            if max_runtime:
+                                remaining = max(0, max_runtime - elapsed)
+                            
+                            # Update checkpoint data
+                            scraper.session_stats.update_checkpoint(current_time, data, remaining)
+                            
+                            # Save final checkpoint
+                            timestamp = int(current_time)
+                            checkpoint_file = f"session_checkpoint_{timestamp}.json"
+                            scraper.session_stats.save(checkpoint_file, is_checkpoint=True)
+                            
+                            logger.info(f"Checkpoint saved to {checkpoint_file}")
+                            logger.info(f"To resume this session later, run: python wazepolice.py --resume {checkpoint_file}")
+                            break
+                        
                         # Check if we've exceeded the maximum runtime
                         current_time = time.time()
                         elapsed = current_time - start_time
@@ -1360,6 +1615,9 @@ def run(
                         try:
                             data = scraper.extract_police_data(max_runtime, start_time)
                             
+                            # Store last data for potential checkpoint saving
+                            scraper.last_data = data
+                            
                             # Save based on the determined format
                             if format == "geojson":
                                 scraper.save_to_geojson(data, output)
@@ -1372,6 +1630,9 @@ def run(
                             # Save raw data if requested
                             if raw_output and hasattr(scraper, "last_raw_data"):
                                 scraper.save_to_raw_json(scraper.last_raw_data, raw_output)
+                                
+                            # Save checkpoint if needed
+                            scraper.check_and_save_checkpoint(data, start_time, max_runtime)
                                 
                             # Calculate remaining runtime if set
                             if max_runtime:
@@ -1393,11 +1654,12 @@ def run(
                             # Brief delay before retrying after an unexpected error
                             time.sleep(5)  
                 except KeyboardInterrupt:
-                    logger.info("Scraping stopped by user")
+                    # This is handled by the signal handler now
+                    pass
                 except Exception as e:
                     logger.error(f"Scraping stopped due to error: {str(e)}")
                 finally:
-                    # Always save session stats at the end if in collate mode
+                    # Always save session stats at the end
                     save_session_stats()
             else:
                 logger.info("Running one-time scraping")
@@ -1421,7 +1683,7 @@ def run(
                 except Exception as e:
                     logger.error(f"Scraping failed: {str(e)}")
                 finally:
-                    # Always save session stats at the end if in collate mode
+                    # Always save session stats at the end
                     save_session_stats()
                     stats_saved = True
             
@@ -1430,10 +1692,10 @@ def run(
         # Try to save session stats if possible, but only if the scraper was initialized
         # and performed at least one API call
         if 'scraper' in locals() and scraper_initialized and hasattr(scraper, 'session_stats') and \
-           collate_mode and not stats_saved and scraper.session_stats.api_calls > 0:
+           not stats_saved and scraper.session_stats.api_calls > 0:
             timestamp = int(time.time())
             stats_file = f"session_error_{timestamp}.json"
-            scraper.session_stats.save(stats_file)
+            scraper.session_stats.save(stats_file, is_error=True)
             stats_saved = True
         raise typer.Exit(code=1)
 
