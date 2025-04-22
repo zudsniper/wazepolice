@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wazepolice"
+version = "3.0.0"
+description = "A Python tool for extracting police reports and other alert types from Waze"
+authors = [
+    {name = "zudsniper", email = ""}
+]
+readme = "README.md"
+requires-python = ">=3.6"
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "pandas",
+    "python-dotenv",
+    "loguru",
+    "geojson",
+    "typer",
+    "folium",
+    "requests",
+    "httpx",
+    "jsonschema"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/zudsniper/wazepolice"
+"Bug Tracker" = "https://github.com/zudsniper/wazepolice/issues"
+
+[tool.setuptools]
+packages = ["wazepolice"] 

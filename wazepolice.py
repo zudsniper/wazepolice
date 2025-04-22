@@ -49,7 +49,6 @@ GITHUB = "https://github.com/zudsniper/wazepolice"
 DEFAULT_BOUNDS = (33.7490, -84.3880, 36.1627, -86.7816)  # Atlanta to Nashville
 DEFAULT_INTERVAL = 600  # 10 minutes
 DEFAULT_ALERT_TYPES = ["POLICE"]  # Default alert types to filter
-DEFAULT_CHECKPOINT_INTERVAL = 300  # 5 minutes
 
 # Define default output names
 DEFAULT_OUTPUT_PREFIX = "all"
@@ -276,7 +275,7 @@ class WazeAPIDataScraper:
         collate: bool = False,
         max_retries: int = 5,
         max_filesize: Optional[int] = None,
-        checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
+        checkpoint_interval: int = DEFAULT_INTERVAL,
         resume_from: Optional[str] = None
     ):
         """
@@ -1362,13 +1361,23 @@ def run(
     version: Optional[bool] = typer.Option(None, "--version", callback=version_callback, is_eager=True, help="Show version information and exit"),
     max_retries: int = typer.Option(5, "--max-retries", help="Maximum number of retry attempts for API calls"),
     max_filesize: str = typer.Option(None, "--max-filesize", help="Maximum total file size in bytes or with units (e.g., '10mb', '1gb')"),
-    checkpoint: int = typer.Option(DEFAULT_CHECKPOINT_INTERVAL, "--checkpoint", help="Interval in seconds to save checkpoint data for potential resume (0 to disable)"),
+    checkpoint: Optional[int] = typer.Option(None, "--checkpoint", help="Interval in seconds to save checkpoint data (defaults to --interval value). Set to 0 to disable."),
     resume: Optional[str] = typer.Option(None, "--resume", help="Resume scraping from a specific saved session file"),
     new: bool = typer.Option(False, "--new", help="Force start a new session even if checkpoint files exist"),
 ):
     """Run the Waze police data API scraper."""
     stats_saved = False  # Track if session stats have been saved
     scraper_initialized = False  # Track if scraper was successfully initialized
+    
+    # Set checkpoint interval based on interval if not explicitly specified or adjust if too large
+    if checkpoint is None:
+        # Default to interval value for continuous scraping
+        checkpoint = interval if interval > 0 else 0
+        logger.info(f"Using default checkpoint interval of {checkpoint} seconds (same as polling interval)")
+    elif interval > 0 and checkpoint > interval:
+        # If checkpoint is larger than interval, adjust it down to interval
+        logger.warning(f"Checkpoint interval ({checkpoint}s) is larger than polling interval ({interval}s). Adjusting to {interval}s.")
+        checkpoint = interval
     
     def signal_handler(sig, frame):
         """Handle interrupt signals gracefully."""

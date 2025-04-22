@@ -17,6 +17,7 @@ Author: github - @zudsniper
 - Full property preservation mode (--full flag)
 - Session interruption handling and resume capability
 - Automatic checkpointing with automatic resume from latest checkpoint
+- Smart checkpoint frequency defaults to match polling interval
 
 ## Installation
 
@@ -93,8 +94,11 @@ python wazepolice.py --raw raw_data.json
 # Use custom JSON schema file
 python wazepolice.py --schema my_schema.json
 
-# Enable automatic checkpointing every 60 seconds
-python wazepolice.py --checkpoint 60
+# Specify custom checkpoint frequency (must be <= interval)
+python wazepolice.py --interval 300 --checkpoint 60
+
+# Disable checkpointing
+python wazepolice.py --checkpoint 0
 
 # Resume from a specific session checkpoint
 python wazepolice.py --resume session_checkpoint_1234567890.json
@@ -113,7 +117,7 @@ python wazepolice.py --resume session_checkpoint_1234567890.json
 | `--runtime` | Maximum runtime in format '99d 99h 99m 99s' | None |
 | `--filter` | Comma-separated list of alert types to extract | POLICE |
 | `--full` | Preserve all alert properties instead of specific fields | False |
-| `--checkpoint` | Interval in seconds to save checkpoint data for potential resume | 300 |
+| `--checkpoint` | Interval in seconds to save checkpoint data | Same as `--interval` value |
 | `--resume` | Resume scraping from a specific saved session file | None |
 | `--new` | Force start a new session even if checkpoint files exist | False |
 | `--help` | Show help information | |
@@ -191,15 +195,17 @@ python wazepolice.py --resume session_checkpoint_1234567890.json
 
 ### Checkpoints
 
-The script automatically saves checkpoints at regular intervals (default: every 5 minutes). You can control this interval with the `--checkpoint` option.
+The script automatically saves checkpoints at regular intervals. By default, the checkpoint interval equals the polling interval (--interval). You can customize this with the `--checkpoint` option, but it cannot be set higher than the polling interval.
 
 ```bash
-# Save checkpoints every 2 minutes
-python wazepolice.py --checkpoint 120
+# Save checkpoints every minute (when polling interval is 5 minutes)
+python wazepolice.py --interval 300 --checkpoint 60
 
 # Disable checkpointing
 python wazepolice.py --checkpoint 0
 ```
+
+If you set `--checkpoint` higher than `--interval`, it will automatically be adjusted down to match the interval with a warning message.
 
 When the script is interrupted (e.g., by pressing Ctrl+C), it will save a final checkpoint before exiting.
 
