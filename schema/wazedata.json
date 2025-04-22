@@ -108,7 +108,7 @@
           "location",
           "pubMillis"
         ],
-        "additionalProperties": false
+        "additionalProperties": true
       },
       "segment": {
         "description": "Defines a single road segment within a jam.",
