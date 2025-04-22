@@ -7,7 +7,7 @@ name = "wazepolice"
 version = "3.0.0"
 description = "A Python tool for extracting police reports and other alert types from Waze"
 authors = [
-    {name = "zudsniper", email = ""}
+    {name = "zudsniper", email = "me@zod.tf"}
 ]
 readme = "README.md"
 requires-python = ">=3.6"
